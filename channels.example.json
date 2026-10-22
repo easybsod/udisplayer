@@ -1,0 +1,14 @@
+{
+  "groups": [
+    "示範分組"
+  ],
+  "channels": [
+    {
+      "id": 1,
+      "name": "示範頻道",
+      "group": "示範分組",
+      "logo": "1.png",
+      "url": "http://udpxy.example.test:4022/udp/239.1.1.1:1234"
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <meta name="color-scheme" content="dark">
+  <meta name="robots" content="noindex,nofollow">
+  <title>IPTV Player</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23181f28'/%3E%3Cpath d='m12 8 12 8-12 8z' fill='%238ce6bc'/%3E%3C/svg%3E">
+  <style>/* INLINE_STYLE */</style>
+</head>
+<body>
+  <div class="shell">
+    <header class="masthead">
+      <a class="brand" href="./" aria-label="IPTV Player 頻道列表"><span class="brand-mark" aria-hidden="true">▶</span>IPTV Player</a>
+      <time id="utc8-clock" class="header-note" aria-label="UTC+8 時間"><span id="utc8-clock-time" class="clock-time"></span><span id="utc8-clock-date" class="clock-date"></span></time>
+    </header>
+    <main id="list-view" hidden>
+      <div class="section-heading"><h1>電視頻道</h1><span id="channel-count" class="count"></span></div>
+      <nav id="channel-groups" class="channel-groups" aria-label="頻道分組" hidden></nav>
+      <ul id="channels" class="channel-grid" aria-label="頻道列表"></ul>
+      <p id="list-message" class="message" role="status" hidden></p>
+    </main>
+    <main id="player-view" hidden>
+      <div class="player-heading"><a class="back-link" href="./" aria-label="返回頻道列表" title="返回頻道列表"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M15 18 9 12l6-6"/></svg></a><h1><span id="channel-title"></span><span class="status-separator" aria-hidden="true"> · </span><span id="playback-status" role="status" aria-live="polite">正在加載</span></h1></div>
+      <video id="video" controls autoplay playsinline preload="auto" aria-label="直播影片"></video>
+    </main>
+    <p id="global-status" class="message" role="status">正在讀取頻道…</p>
+  </div>
+  <noscript><p>請啟用 JavaScript 以載入頻道與直播。</p></noscript>
+  <script>/* INLINE_HLS */</script>
+  <script>/* INLINE_APP */</script>
+</body>
+</html>
