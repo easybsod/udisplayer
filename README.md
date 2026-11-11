@@ -24,6 +24,7 @@ udisplayer 是一個自架的 IPTV Web 播放器。它從 **udpxy 或其他 HTTP
 - **集中管理頻道**：可設定頻道名稱、分組與 Logo，也可匯入 Extended M3U 清單。
 - **分享同一條串流**：多人觀看同一頻道時，伺服器只需執行一個 FFmpeg 轉流程序。
 - **節省頻寬**：超過 1080p 的影像自動縮小；視訊統一輸出 H.264，音訊為 AAC。
+- **選用 GPU 加速**：Linux 支援 VA-API 硬體解碼及 H.264 硬體編碼；GPU 不可用時自動使用 CPU。
 - **自動回收資源**：沒有觀眾的頻道會停止轉流，避免長時間佔用 CPU。
 - **自訂存取路徑**：可以設定 URL 前綴，並接在 Nginx 等反向代理後方使用。
 
@@ -305,6 +306,47 @@ python3 server.py --path /tv/my-long-private-path
 瀏覽器網址就變成 `http://伺服器IP:8081/tv/my-long-private-path/`。注意末尾的 `/`。以上指令是**原始碼版**；若使用單檔版，請把 `python3 server.py` 替換為 `./udisplayer-linux-x86_64`。
 
 > **安全提醒：** udisplayer 沒有內建帳號登入功能，`--path` 也不是密碼驗證。若要讓公網存取，建議把服務綁在 `127.0.0.1`，由 HTTPS 反向代理提供存取控制；不要僅靠難猜的 URL 保護內容。
+
+### Linux：啟用 VA-API 硬體編解碼（選用）
+
+udisplayer 在 **Linux** 會自動尋找第一個可存取的 `/dev/dri/renderD*`。只要 FFmpeg、VA-API Runtime、顯示卡驅動及裝置權限都正常，就會**優先硬解來源視訊、優先以 GPU 編碼 H.264**；其中任何一端無法使用時，會獨立回退 CPU，不需要手動選擇輸入編碼格式。輸出一律為 H.264／AAC。
+
+先安裝所用顯示卡的 VA-API 驅動及測試工具。例如在 **Ubuntu／Debian（Intel GPU）**：
+
+```bash
+sudo apt install -y vainfo libva-drm2 intel-media-va-driver
+```
+
+**Rocky Linux／RHEL 類系統（Intel GPU）**可先安裝 `libva`、`intel-gmmlib`，再從與發行版相容的套件來源（部分版本需要 RPM Fusion Nonfree）安裝 `intel-media-driver`。AMD 等其他 GPU 需改用對應的 VA-API 驅動，不應直接安裝 Intel 驅動。套件名稱依發行版及 GPU 世代而異。
+
+檢查 GPU 與硬體編碼能力：
+
+```bash
+ls -l /dev/dri/renderD*
+vainfo --display drm --device /dev/dri/renderD128
+ffmpeg -hide_banner -encoders | grep h264_vaapi
+```
+
+其中 `vainfo` 應確認所需的解碼 `VAEntrypointVLD` 與 H.264 編碼 `VAEntrypointEncSlice`／`VAEntrypointEncSliceLP`；**FFmpeg 有列出 `h264_vaapi` 並不保證 GPU 真能硬編**，程式啟動時還會執行實際的硬編影格測試。
+
+啟動方式：
+
+```bash
+# 自動選擇第一個可用的 GPU（預設）
+python3 server.py
+
+# 明確指定 DRM Render Node
+python3 server.py --hw-render=/dev/dri/renderD128
+
+# 不使用 GPU，強制 CPU 解碼與編碼
+python3 server.py --hw-render=none
+```
+
+如果使用單檔版，將 `python3 server.py` 換成 `./udisplayer-linux-x86_64`。多張 GPU 時，也可指定 `/dev/dri/by-path/` 下實際存在的 `pci-*-render` 符號連結；**明確指定的裝置若不存在或無權限，程式會報錯，不會偷偷切到另一張 GPU**。
+
+加上 `--debug` 後，可從啟動日誌查看 `device_ok=True`、`h264_encode=True`，播放頻道時則會顯示 `transcoder=vaapi_decode_encode`、`transcoder=vaapi_encode` 等實際管線。若服務經 systemd 啟動，請另外確認執行帳號可存取 `render` 群組與 Render Node；設有 `PrivateDevices=true` 的系統服務還必須調整裝置隔離設定。
+
+更完整的 [Linux VA-API 安裝、systemd 權限、排錯及回退說明](docs/HARDWARE-ACCELERATION.md) 見技術文件。
 
 ### 接到 Nginx 後方（選用）
 
