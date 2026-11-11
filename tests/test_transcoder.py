@@ -1,4 +1,5 @@
 import io
+import os
 import tempfile
 import threading
 import time
@@ -8,6 +9,8 @@ from unittest.mock import patch
 
 from udisplayer.config import Channel, Settings
 from udisplayer.transcoder import StreamError, StreamManager, ffmpeg_command
+from udisplayer.transcoder import (backend_candidates, HW_DECODE_HW_ENCODE,
+                                  SW_DECODE_HW_ENCODE, HW_DECODE_SW_ENCODE, SOFTWARE)
 
 
 class FakeProcess:
@@ -71,6 +74,164 @@ class TranscoderTests(unittest.TestCase):
         self.assertIn("-progress", debug)
         self.assertEqual(debug[debug.index("-progress") + 1], "pipe:1")
         self.assertNotIn("-stats_period", debug)
+
+    def test_hardware_pipeline_uses_same_hls_and_dimensions(self):
+        settings = Settings(ffmpeg="/usr/bin/ffmpeg", hw_render="/dev/dri/renderD128",
+                            hw_decode=True, hw_encode=True, hw_rc_mode="VBR")
+        self.assertEqual(backend_candidates(settings), (HW_DECODE_HW_ENCODE,
+                         SW_DECODE_HW_ENCODE, HW_DECODE_SW_ENCODE, SOFTWARE))
+        for backend in backend_candidates(settings):
+            with self.subTest(backend=backend):
+                cmd = ffmpeg_command(settings, self.channel, Path("/tmp/hw"),
+                                     backend=backend, start_number=1234, discontinuity=True)
+                rendered = " ".join(cmd)
+                self.assertEqual(cmd.count("-map"), 2)
+                self.assertIn("-start_number 1234", rendered)
+                self.assertIn("discont_start", rendered)
+                self.assertIn("force_original_aspect_ratio=decrease", rendered)
+                self.assertIn("bwdif=mode=send_frame", rendered)
+                self.assertIn("-c:a aac", rendered)
+                self.assertIn("-f hls", rendered)
+                self.assertIn("-hls_time 2", rendered)
+                self.assertEqual("h264_vaapi" in cmd, backend in
+                                 (HW_DECODE_HW_ENCODE, SW_DECODE_HW_ENCODE))
+                self.assertEqual("-hwaccel" in cmd, backend in
+                                 (HW_DECODE_HW_ENCODE, HW_DECODE_SW_ENCODE))
+                self.assertEqual("-rc_mode" in cmd, backend in
+                                 (HW_DECODE_HW_ENCODE, SW_DECODE_HW_ENCODE))
+                if backend == HW_DECODE_HW_ENCODE:
+                    self.assertIn("scale_vaapi=format=nv12,hwdownload,format=nv12", rendered)
+                    self.assertIn("format=nv12,hwupload", rendered)
+                if backend == SOFTWARE:
+                    self.assertNotIn("-init_hw_device", cmd)
+
+    def test_decoder_encoder_fallback_are_independent(self):
+        base = dict(ffmpeg="/usr/bin/ffmpeg", hw_render="/dev/dri/renderD128")
+        self.assertEqual(backend_candidates(Settings(**base, hw_encode=True)),
+                         (SW_DECODE_HW_ENCODE, SOFTWARE))
+        self.assertEqual(backend_candidates(Settings(**base, hw_decode=True)),
+                         (HW_DECODE_SW_ENCODE, SOFTWARE))
+        self.assertEqual(backend_candidates(Settings(**base)), (SOFTWARE,))
+        with self.assertRaisesRegex(ValueError, "尚未驗證"):
+            ffmpeg_command(Settings(**base), self.channel, Path("/tmp"),
+                           backend=SW_DECODE_HW_ENCODE)
+
+    def test_hardware_exit_restarts_with_same_token_and_software_last(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(ffmpeg="/usr/bin/ffmpeg", cache_dir=Path(tmp),
+                                hw_render="/dev/dri/renderD128", hw_decode=True, hw_encode=True,
+                                startup_timeout=3)
+            processes = []
+
+            def fake_popen(cmd, **_kwargs):
+                p = FakeProcess()
+                processes.append(p)
+                # Synthetic failures for all accelerated profiles, preserving
+                # the same token and keeping existing HLS segment names unique.
+                if len(processes) < 3:
+                    p.returncode = 1
+                else:
+                    playlist = Path(cmd[-1])
+                    playlist.write_text("#EXTM3U\n#EXTINF:2.0,\nsegment_000000999.ts\n")
+                    os.utime(playlist, (time.time() + 1, time.time() + 1))
+                return p
+
+            with patch("udisplayer.transcoder.subprocess.Popen", side_effect=fake_popen):
+                manager = StreamManager(settings, (self.channel,))
+                try:
+                    playlist = manager.playlist(1, "a" * 32)
+                    stream = manager.streams[1]
+                    self.assertIn(b"segment_", playlist)
+                    self.assertEqual(stream.backends[stream.backend_index], SOFTWARE)
+                    self.assertEqual(len(processes), 3)
+                    self.assertEqual(stream.token, manager.streams[1].token)
+                finally:
+                    manager.close()
+
+    def test_network_failure_does_not_downgrade_gpu(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(ffmpeg="/usr/bin/ffmpeg", cache_dir=Path(tmp),
+                                hw_render="/dev/dri/renderD128", hw_decode=True, hw_encode=True)
+            with patch("udisplayer.transcoder.subprocess.Popen", side_effect=lambda *_a, **_k: FakeProcess()):
+                manager = StreamManager(settings, (self.channel,))
+                try:
+                    with manager.lock:
+                        stream = manager._ensure_locked(1)
+                        stream.errors.append("HTTP error 503 Service Unavailable")
+                        self.assertFalse(manager._recover_locked(1, stream, "exit"))
+                        self.assertEqual(stream.backend_index, 0)
+                        stream.errors.clear()
+                        stream.errors.append("Failed to initialise VAAPI hardware device")
+                        self.assertTrue(manager._recover_locked(1, stream, "exit"))
+                        self.assertEqual(stream.backend_index, 1)
+                finally:
+                    manager.close()
+
+    def test_encoder_error_preserves_hardware_decoder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(ffmpeg="/usr/bin/ffmpeg", cache_dir=Path(tmp),
+                                hw_render="/dev/dri/renderD128", hw_decode=True, hw_encode=True)
+            with patch("udisplayer.transcoder.subprocess.Popen",
+                       side_effect=lambda *_a, **_k: FakeProcess()):
+                manager = StreamManager(settings, (self.channel,))
+                try:
+                    with manager.lock:
+                        stream = manager._ensure_locked(1)
+                        stream.errors.append("[h264_vaapi] Encoder failed to initialize")
+                        self.assertTrue(manager._recover_locked(1, stream, "exit"))
+                        self.assertEqual(stream.backends[stream.backend_index], HW_DECODE_SW_ENCODE)
+                        self.assertTrue(stream.encode_failed)
+                        self.assertFalse(stream.decode_failed)
+                        stream.errors.append("Error during decoding")
+                        self.assertTrue(manager._recover_locked(1, stream, "exit"))
+                        self.assertEqual(stream.backends[stream.backend_index], SOFTWARE)
+                finally:
+                    manager.close()
+
+    def test_decoder_error_preserves_hardware_encoder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(ffmpeg="/usr/bin/ffmpeg", cache_dir=Path(tmp),
+                                hw_render="/dev/dri/renderD128", hw_decode=True, hw_encode=True)
+            with patch("udisplayer.transcoder.subprocess.Popen",
+                       side_effect=lambda *_a, **_k: FakeProcess()):
+                manager = StreamManager(settings, (self.channel,))
+                try:
+                    with manager.lock:
+                        stream = manager._ensure_locked(1)
+                        stream.errors.append("Failed setup for format vaapi in decoder")
+                        self.assertTrue(manager._recover_locked(1, stream, "exit"))
+                        self.assertEqual(stream.backends[stream.backend_index], SW_DECODE_HW_ENCODE)
+                        self.assertTrue(stream.decode_failed)
+                        self.assertFalse(stream.encode_failed)
+                        stream.errors.append("h264_vaapi encoding error")
+                        self.assertTrue(manager._recover_locked(1, stream, "exit"))
+                        self.assertEqual(stream.backends[stream.backend_index], SOFTWARE)
+                finally:
+                    manager.close()
+
+    def test_filter_failure_does_not_misclassify_downstream_encoder_eof(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(ffmpeg="/usr/bin/ffmpeg", cache_dir=Path(tmp),
+                                hw_render="/dev/dri/renderD128", hw_decode=True, hw_encode=True)
+            with patch("udisplayer.transcoder.subprocess.Popen",
+                       side_effect=lambda *_a, **_k: FakeProcess()):
+                manager = StreamManager(settings, (self.channel,))
+                try:
+                    with manager.lock:
+                        stream = manager._ensure_locked(1)
+                        stream.errors.extend((
+                            "Impossible to convert between the formats supported by the filter ",
+                            "[vf#0:0] Error reinitializing filters!",
+                            "[vost#0:0/h264_vaapi] Could not open encoder before EOF",
+                            "[vost#0:0/h264_vaapi] Terminating thread with return code -22",
+                            "[out#0/hls] Nothing was written into output file",
+                        ))
+                        self.assertTrue(manager._recover_locked(1, stream, "exit"))
+                        self.assertEqual(stream.backends[stream.backend_index], SW_DECODE_HW_ENCODE)
+                        self.assertTrue(stream.decode_failed)
+                        self.assertFalse(stream.encode_failed)
+                finally:
+                    manager.close()
 
     def test_playlist_starts_one_worker_and_reuses_it(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -24,6 +24,50 @@ SOURCE_EVENT_PATTERNS = (
     ("timestamp", re.compile(r"non[- ]monoton|timestamp|\b(?:dts|pts)\b.*(?:invalid|out of order)", re.I)),
 )
 
+SOURCE_TERMINAL_ERRORS = re.compile(
+    r"tim(?:e|ed) ?out|connection (?:reset|refused|closed)|broken pipe|"
+    r"http error (?:4\d\d|5\d\d)|server returned (?:4\d\d|5\d\d)|"
+    r"name or service not known|temporary failure in name resolution|"
+    r"network is unreachable|no route to host", re.I,
+)
+HARDWARE_ERRORS = re.compile(
+    r"vaapi|va-api|libva|hwupload|hwdownload|hardware device|"
+    r"failed to create (?:a )?device|no hw frames", re.I,
+)
+
+DECODE_ERRORS = re.compile(
+    r"hwdownload|scale_vaapi|decoder|decoding|decode failed|"
+    r"failed setup for format vaapi|failed to transfer.*from hardware|"
+    r"failed to retrieve.*frame|impossible to convert between the formats|"
+    r"error reinitializing filters|auto_scale_", re.I,
+)
+ENCODE_ERRORS = re.compile(
+    r"encoder failed to initialize|failed to (?:initialize|initialise) encoder|"
+    r"error (?:initializing|initialising) output stream|error while opening encoder|"
+    r"error (?:while )?encoding|encode failed|rate control|rc_mode|failed to upload|"
+    r"h264_vaapi.*(?:unsupported|failed|error|invalid configuration)", re.I,
+)
+
+# Failover is per channel.  The HLS URL and viewer sessions remain unchanged;
+# a new encoder continues the same MPEG-TS/H.264/AAC playlist sequence.
+HW_DECODE_HW_ENCODE = "vaapi_decode_encode"
+SW_DECODE_HW_ENCODE = "vaapi_encode"
+HW_DECODE_SW_ENCODE = "vaapi_decode"
+SOFTWARE = "software"
+
+
+def backend_candidates(settings: Settings) -> tuple[str, ...]:
+    if not settings.hw_render:
+        return (SOFTWARE,)
+    if settings.hw_decode and settings.hw_encode:
+        return (HW_DECODE_HW_ENCODE, SW_DECODE_HW_ENCODE,
+                HW_DECODE_SW_ENCODE, SOFTWARE)
+    if settings.hw_encode:
+        return (SW_DECODE_HW_ENCODE, SOFTWARE)
+    if settings.hw_decode:
+        return (HW_DECODE_SW_ENCODE, SOFTWARE)
+    return (SOFTWARE,)
+
 
 class StreamError(Exception):
     def __init__(self, status: int, message: str):
@@ -31,16 +75,32 @@ class StreamError(Exception):
         super().__init__(message)
 
 
-def ffmpeg_command(settings: Settings, channel: Channel, directory: Path) -> list[str]:
+def ffmpeg_command(settings: Settings, channel: Channel, directory: Path,
+                   *, backend: str = SOFTWARE, start_number: int | None = None,
+                   discontinuity: bool = False) -> list[str]:
     # Preserve source resolution up to 1080p. Larger sources are downscaled
     # inside 1920x1080, then encoded as progressive H.264/AAC for broad browser
     # compatibility and smoother Internet playback.
-    start_number = str(int(time.time() // 2))
+    start_number = str(int(time.time() // 2) if start_number is None else start_number)
+    hardware_decode = backend in (HW_DECODE_HW_ENCODE, HW_DECODE_SW_ENCODE)
+    hardware_encode = backend in (HW_DECODE_HW_ENCODE, SW_DECODE_HW_ENCODE)
+    if backend not in (HW_DECODE_HW_ENCODE, SW_DECODE_HW_ENCODE, HW_DECODE_SW_ENCODE, SOFTWARE):
+        raise ValueError("不支援的轉碼管線")
+    if (hardware_decode and not settings.hw_decode) or (hardware_encode and not settings.hw_encode):
+        raise ValueError("尚未驗證要求的硬體轉碼能力")
+    if (hardware_decode or hardware_encode) and not settings.hw_render:
+        raise ValueError("硬體轉碼缺少 DRM Render Node")
     command = [settings.ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "warning"]
     if settings.debug:
         # FFmpeg's machine-readable progress stream is emitted on stdout only in
         # debug mode; media still goes to HLS files.
         command += ["-progress", "pipe:1"]
+    if hardware_decode or hardware_encode:
+        command += ["-init_hw_device", f"vaapi=va:{settings.hw_render}",
+                    "-filter_hw_device", "va"]
+    if hardware_decode:
+        command += ["-hwaccel", "vaapi", "-hwaccel_device", "va",
+                    "-hwaccel_output_format", "vaapi"]
     command += [
         "-y", "-rw_timeout", "10000000", "-fflags", "+discardcorrupt",
         "-analyzeduration", "500000", "-probesize", "500000",
@@ -50,26 +110,42 @@ def ffmpeg_command(settings: Settings, channel: Channel, directory: Path) -> lis
         # with SAR 16:15 for a 4:3 picture). First bake SAR into the coded width
         # so browsers receive square pixels with the correct DAR. Then cap the
         # square-pixel result inside 1920x1080; <=1080p sources remain unchanged.
-        "-vf", ("bwdif=mode=send_frame:parity=auto:deint=interlaced,"
+        "-vf", (("scale_vaapi=format=nv12,hwdownload,format=nv12," if hardware_decode else "")
+                + "bwdif=mode=send_frame:parity=auto:deint=interlaced,"
                 "scale=w='max(2,trunc(iw*if(gt(sar,0),sar,1)/2)*2)':"
                 "h='max(2,trunc(ih/2)*2)':flags=fast_bilinear,setsar=1,"
                 "scale=w='min(iw,1920)':h='min(ih,1080)':"
                 "force_original_aspect_ratio=decrease:force_divisible_by=2:"
-                "flags=fast_bilinear"),
+                "flags=fast_bilinear"
+                + (",format=nv12,hwupload" if hardware_encode else ",format=yuv420p")),
         # superfast leaves enough realtime headroom for 1080i + bwdif on the
         # production 2-vCPU host. A fixed CCTV-5 sample benchmark improved from
         # about 1.09x (veryfast) to 1.58x while staying near the same 2.2 Mbps VBV.
-        "-c:v", "libx264", "-preset", "superfast",
-        "-crf", "26", "-pix_fmt", "yuv420p", "-profile:v", "high", "-bf", "2", "-refs", "3",
-        "-threads:v", str(settings.encoder_threads), "-g", "60", "-keyint_min", "1",
-        "-sc_threshold", "0", "-flags", "+cgop", "-forced-idr", "1",
+        "-c:v", "h264_vaapi" if hardware_encode else "libx264",
+    ]
+    if hardware_encode:
+        # VA-API rate-control is driver-specific. No CPU preset/CRF or x264-only
+        # switches are passed to the hardware encoder.
+        command += ["-profile:v", "high", "-bf", "0", "-b:v", "2000000"]
+        if settings.hw_rc_mode == "VBR":
+            command += ["-rc_mode", "VBR"]
+    else:
+        command += ["-preset", "superfast", "-crf", "26", "-pix_fmt", "yuv420p",
+                    "-profile:v", "high", "-bf", "2", "-refs", "3",
+                    "-threads:v", str(settings.encoder_threads), "-forced-idr", "1"]
+    command += ["-g", "60", "-keyint_min", "1"]
+    if not hardware_encode:
+        command += ["-sc_threshold", "0"]
+    command += [
+        "-flags", "+cgop",
         "-force_key_frames:v", "expr:gte(t,n_forced*2)",
         "-maxrate:v", "2200000", "-bufsize:v", "2200000",
         "-c:a", "aac", "-profile:a", "aac_low", "-ac", "2", "-ar", "48000",
         "-af", "aresample=async=1", "-b:a", "80000",
         "-f", "hls", "-hls_time", "2", "-hls_list_size", "24",
         "-hls_delete_threshold", "6", "-start_number", start_number,
-        "-hls_flags", "delete_segments+independent_segments+temp_file+program_date_time",
+        "-hls_flags", "delete_segments+independent_segments+temp_file+program_date_time"
+        + ("+discont_start" if discontinuity else ""),
         "-hls_segment_filename", str(directory / "segment_%09d.ts"),
         str(directory / "index.m3u8"),
     ]
@@ -89,6 +165,14 @@ class Stream:
     errors: deque = field(default_factory=lambda: deque(maxlen=12))
     source_events: Counter = field(default_factory=Counter)
     debug_last_summary: float = 0
+    backends: tuple[str, ...] = (SOFTWARE,)
+    backend_index: int = 0
+    start_number: int = 0
+    ready_after: float = 0.0
+    decode_failed: bool = False
+    encode_failed: bool = False
+    error_lock: threading.Lock = field(default_factory=threading.Lock)
+    error_reader: threading.Thread | None = None
 
 
 class StreamManager:
@@ -106,10 +190,10 @@ class StreamManager:
         self.reaper = threading.Thread(target=self._reap, daemon=True, name="stream-reaper")
         self.reaper.start()
 
-    def _read_errors(self, stream: Stream):
-        assert stream.process.stderr is not None
-        with stream.process.stderr:
-            for line in stream.process.stderr:
+    def _read_errors(self, stream: Stream, process: subprocess.Popen):
+        assert process.stderr is not None
+        with process.stderr:
+            for line in process.stderr:
                 # Source URLs may contain credentials. Keep them out of logs.
                 cleaned = line.strip().replace(stream.channel.url, "[source]")
                 cleaned = re.sub(r"https?://\S+", "[source]", cleaned)[:500]
@@ -117,22 +201,23 @@ class StreamManager:
                     (name for name, pattern in SOURCE_EVENT_PATTERNS if pattern.search(cleaned)),
                     None,
                 )
-                with self.lock:
-                    stream.errors.append(cleaned)
-                    if self.settings.debug and category:
-                        stream.source_events[category] += 1
+                with stream.error_lock:
+                    if stream.process is process:
+                        stream.errors.append(cleaned)
+                        if self.settings.debug and category:
+                            stream.source_events[category] += 1
                 if self.settings.debug and category:
                     LOG.debug(
                         "source_event channel=%s category=%s message=%s",
                         stream.channel.id, category, cleaned,
                     )
 
-    def _read_progress(self, stream: Stream):
-        assert stream.process.stdout is not None
+    def _read_progress(self, stream: Stream, process: subprocess.Popen):
+        assert process.stdout is not None
         values = {}
         last_emit = 0.0
-        with stream.process.stdout:
-            for raw in stream.process.stdout:
+        with process.stdout:
+            for raw in process.stdout:
                 line = raw.strip()
                 if "=" not in line:
                     continue
@@ -182,7 +267,8 @@ class StreamManager:
         LOG.debug(
             "hls_production channel=%s playlist_age_ms=%d segment_count=%d "
             "avg_duration_s=%.3f avg_size_kb=%.1f latest_segment=%s "
-            "latest_generation_gap_ms=%s avg_generation_gap_ms=%s sessions=%d source_events=%s",
+            "latest_generation_gap_ms=%s avg_generation_gap_ms=%s sessions=%d "
+            "source_events=%s transcoder=%s",
             cid,
             max(0, int((time.time() - stat.st_mtime) * 1000)),
             len(segments),
@@ -193,6 +279,7 @@ class StreamManager:
             int(sum(gaps) / len(gaps)) if gaps else "-",
             len(stream.sessions),
             dict(stream.source_events),
+            stream.backends[stream.backend_index],
         )
 
     def _stop_locked(self, cid: int, reason: str):
@@ -226,6 +313,96 @@ class StreamManager:
             if stream.errors:
                 LOG.warning("channel=%s ffmpeg: %s", cid, stream.errors[-1])
 
+    def _launch(self, stream: Stream, *, discontinuity: bool):
+        backend = stream.backends[stream.backend_index]
+        # Do not reuse names produced by a previous process, even if two
+        # fallbacks happen within the same two-second clock interval.
+        existing = [int(m.group(1)) for path in stream.directory.glob("segment_*.ts")
+                    if (m := re.fullmatch(r"segment_(\d+)\.ts", path.name))]
+        stream.start_number = max(int(time.time() // 2), stream.start_number + 1,
+                                  max(existing, default=0) + 1)
+        process = subprocess.Popen(
+            ffmpeg_command(self.settings, stream.channel, stream.directory,
+                           backend=backend, start_number=stream.start_number,
+                           discontinuity=discontinuity),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if self.settings.debug else subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True, errors="replace",
+        )
+        stream.process = process
+        stream.started = time.monotonic()
+        stream.ready_after = time.time() if discontinuity else 0.0
+        with stream.error_lock:
+            stream.errors.clear()
+        reader = threading.Thread(target=self._read_errors, args=(stream, process), daemon=True)
+        stream.error_reader = reader
+        reader.start()
+        if self.settings.debug:
+            threading.Thread(target=self._read_progress, args=(stream, process), daemon=True).start()
+        LOG.info("channel=%s transcoder=%s pid=%s", stream.channel.id, backend, process.pid)
+
+    def _recover_locked(self, cid: int, stream: Stream, reason: str) -> bool:
+        """Disable only the failing acceleration stage of this channel."""
+        # Drain diagnostics from the finished FFmpeg before deciding which
+        # side failed. The stderr reader uses its own lock, so joining it does
+        # not deadlock this manager's lock during recovery.
+        if stream.process.poll() is not None and stream.error_reader:
+            stream.error_reader.join(timeout=0.5)
+        with stream.error_lock:
+            messages = tuple(stream.errors)
+        # A dead source is not a reason to permanently downgrade the encoder.
+        # Let the existing bounded cooldown retry the preferred profile once
+        # the source has recovered.
+        if reason == "exit" and any(SOURCE_TERMINAL_ERRORS.search(line) for line in messages) \
+                and not any(HARDWARE_ERRORS.search(line) for line in messages):
+            return False
+        old = stream.backends[stream.backend_index]
+        decoding = old in (HW_DECODE_HW_ENCODE, HW_DECODE_SW_ENCODE)
+        encoding = old in (HW_DECODE_HW_ENCODE, SW_DECODE_HW_ENCODE)
+        if not (decoding or encoding):
+            return False
+        errors = "\n".join(messages)
+        decoder_issue = bool(DECODE_ERRORS.search(errors))
+        encoder_issue = bool(ENCODE_ERRORS.search(errors))
+        # When FFmpeg identifies a specific failing stage, keep the other
+        # stage accelerated. For generic failures, try software decoding first
+        # while preserving the verified H.264 encoder.
+        if decoding and decoder_issue and not encoder_issue:
+            stream.decode_failed = True
+        elif encoding and encoder_issue and not decoder_issue:
+            stream.encode_failed = True
+        elif decoding:
+            stream.decode_failed = True
+        elif encoding:
+            stream.encode_failed = True
+
+        next_index = next((index for index, candidate in enumerate(stream.backends)
+                           if candidate != old
+                           and (not stream.decode_failed or candidate not in
+                                (HW_DECODE_HW_ENCODE, HW_DECODE_SW_ENCODE))
+                           and (not stream.encode_failed or candidate not in
+                                (HW_DECODE_HW_ENCODE, SW_DECODE_HW_ENCODE))), None)
+        if next_index is None:
+            return False
+        if stream.process.poll() is None:
+            stream.process.terminate()
+            try:
+                stream.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                stream.process.kill()
+                stream.process.wait(timeout=3)
+        prior_error = messages[-1] if messages else "none"
+        stream.backend_index = next_index
+        try:
+            self._launch(stream, discontinuity=True)
+        except OSError as exc:
+            LOG.warning("channel=%s transcoder_fallback spawn_error=%s", cid, type(exc).__name__)
+            return False
+        LOG.warning("channel=%s transcoder_fallback from=%s to=%s reason=%s last_error=%s",
+                    cid, old, stream.backends[stream.backend_index], reason, prior_error)
+        return True
+
     @staticmethod
     def _touch_locked(stream: Stream, session: str | None, now: float | None = None):
         now = time.monotonic() if now is None else now
@@ -246,8 +423,9 @@ class StreamManager:
             raise StreamError(410, "串流已釋放")
         stream = self.streams.get(cid)
         if stream and stream.process.poll() is not None:
-            self._stop_locked(cid, "failed")
-            stream = None
+            if not self._recover_locked(cid, stream, "exit"):
+                self._stop_locked(cid, "failed")
+                stream = None
         if stream:
             self._touch_locked(stream, session, now)
             return stream
@@ -258,26 +436,15 @@ class StreamManager:
         token = uuid.uuid4().hex
         directory = self.root / token
         directory.mkdir(parents=True, exist_ok=False)
+        stream = Stream(channel, token, directory, None, now, now,
+                        backends=backend_candidates(self.settings))
         try:
-            process = subprocess.Popen(
-                ffmpeg_command(self.settings, channel, directory),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE if self.settings.debug else subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-                errors="replace",
-            )
+            self._launch(stream, discontinuity=False)
         except OSError as exc:
             shutil.rmtree(directory, ignore_errors=True)
             raise StreamError(502, "無法啟動 FFmpeg") from exc
-        stream = Stream(channel, token, directory, process, now, now)
         self._touch_locked(stream, session, now)
         self.streams[cid] = stream
-        threading.Thread(target=self._read_errors, args=(stream,), daemon=True).start()
-        if self.settings.debug:
-            threading.Thread(target=self._read_progress, args=(stream,), daemon=True).start()
-        if self.settings.debug:
-            LOG.debug("channel=%s started pid=%s", cid, process.pid)
         return stream
 
     @staticmethod
@@ -286,7 +453,9 @@ class StreamManager:
             # Start as soon as the first complete segment exists. Playback is
             # allowed to drift behind the source later; startup itself should not
             # deliberately wait for a large buffer.
-            return (stream.directory / "index.m3u8").read_text().count("#EXTINF:") >= 1
+            playlist = stream.directory / "index.m3u8"
+            return (playlist.stat().st_mtime >= stream.ready_after
+                    and playlist.read_text().count("#EXTINF:") >= 1)
         except (FileNotFoundError, OSError, UnicodeError):
             return False
 
@@ -312,6 +481,8 @@ class StreamManager:
                     raise StreamError(410, "串流已釋放")
                 self._touch_locked(stream, session, now)
                 if stream.process.poll() is not None:
+                    if self._recover_locked(cid, stream, "exit"):
+                        continue
                     self._stop_locked(cid, "failed")
                     raise StreamError(502, "來源無法連線或轉碼失敗")
                 if self._ready(stream):
@@ -320,6 +491,9 @@ class StreamManager:
                     except (FileNotFoundError, OSError, UnicodeError):
                         pass
                 if now >= deadline:
+                    if self._recover_locked(cid, stream, "startup_timeout"):
+                        deadline = time.monotonic() + self.settings.startup_timeout
+                        continue
                     self._stop_locked(cid, "startup_timeout")
                     raise StreamError(504, "串流啟動逾時，請確認來源是否可用")
             self.closed.wait(0.15)
@@ -377,7 +551,8 @@ class StreamManager:
                     if now - stream.last_request > self.settings.idle_timeout:
                         self._stop_locked(cid, "idle")
                     elif stream.process.poll() is not None:
-                        self._stop_locked(cid, "failed")
+                        if not self._recover_locked(cid, stream, "exit"):
+                            self._stop_locked(cid, "failed")
                     elif now - stream.started > self.settings.startup_timeout:
                         playlist = stream.directory / "index.m3u8"
                         try:
@@ -385,9 +560,11 @@ class StreamManager:
                         except FileNotFoundError:
                             latest = 0
                         if not latest:
-                            self._stop_locked(cid, "startup_timeout")
+                            if not self._recover_locked(cid, stream, "startup_timeout"):
+                                self._stop_locked(cid, "startup_timeout")
                         elif time.time() - latest > 20:
-                            self._stop_locked(cid, "stalled")
+                            if not self._recover_locked(cid, stream, "stalled"):
+                                self._stop_locked(cid, "stalled")
                         elif now - stream.started > 60:
                             self.cooldowns.pop(cid, None)
 

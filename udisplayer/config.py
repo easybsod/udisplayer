@@ -44,6 +44,10 @@ class Settings:
     encoder_threads: int = 2
     cache_dir: Path | None = None
     debug: bool = False
+    hw_render: str | None = None
+    hw_decode: bool = False
+    hw_encode: bool = False
+    hw_rc_mode: str = "auto"
 
 
 def normalize_prefix(value: str) -> str:

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from . import __version__
 from .config import Settings, normalize_prefix, read_config, resolve_ffmpeg, validate_ffmpeg
+from .hardware import probe_vaapi, select_render_device
 from .server import AppServer
 
 
@@ -34,6 +35,8 @@ def main(argv=None) -> int:
     parser.add_argument("--version", action="version", version=f"udisplayer {__version__}")
     parser.add_argument("--licenses", action="store_true", help="顯示第三方授權")
     parser.add_argument("--ffmpeg", help="FFmpeg 執行檔路徑；省略時搜尋 PATH")
+    parser.add_argument("--hw-render", metavar="RENDER|none",
+                        help="指定 DRM Render Node；預設取第一個，none 停用硬體加速")
     parser.add_argument("--path", default="/", help="HTTP URL 前綴，預設 /")
     parser.add_argument("--config", type=Path, default=default_config())
     parser.add_argument("--init-config", action="store_true", help="在 --config 位置建立範例配置")
@@ -73,12 +76,16 @@ def main(argv=None) -> int:
         if args.port > 65535:
             raise ValueError("--port 不可超過 65535")
         config = read_config(args.config)
-        settings = Settings(ffmpeg=resolve_ffmpeg(args.ffmpeg), prefix=normalize_prefix(args.path),
+        ffmpeg = resolve_ffmpeg(args.ffmpeg)
+        version = validate_ffmpeg(ffmpeg)
+        render = select_render_device(args.hw_render)
+        hw_decode, hw_encode, hw_rc_mode = probe_vaapi(ffmpeg, render)
+        settings = Settings(ffmpeg=ffmpeg, prefix=normalize_prefix(args.path),
                             host=args.host, port=args.port, startup_timeout=args.startup_timeout,
                             idle_timeout=args.idle_timeout, max_streams=args.max_streams,
                             encoder_threads=args.encoder_threads, cache_dir=args.cache_dir,
-                            debug=args.debug)
-        version = validate_ffmpeg(settings.ffmpeg)
+                            debug=args.debug, hw_render=render, hw_decode=hw_decode,
+                            hw_encode=hw_encode, hw_rc_mode=hw_rc_mode)
         server = AppServer(
             settings,
             config,

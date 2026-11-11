@@ -457,7 +457,7 @@ python3 tools/build_web.py
 
 **觀看幾個不同頻道後 CPU 使用率很高**
 
-每個**正在使用的不同頻道**需要一個 FFmpeg 視訊編碼程序；多人看同一頻道則共用。若伺服器 CPU 較少，可降低 `--max-streams`，例如 `--max-streams 2`。來源的解析度、隔行掃描以及編碼速度也會影響負載。
+每個**正在使用的不同頻道**需要一個 FFmpeg 視訊編碼程序；多人看同一頻道則共用。若伺服器 CPU 較少，可降低 `--max-streams`，例如 `--max-streams 2`。在 Linux 可透過 DRM Render Node 啟用 VA-API 硬體解碼／H.264 硬體編碼（詳見 [硬體加速說明](docs/HARDWARE-ACCELERATION.md)）。沒有可用 GPU 或驅動時仍沿用原有軟體轉碼。
 
 **串流停止後暫存資料會保留嗎？**
 
@@ -484,6 +484,7 @@ python3 server.py --debug
 | `--port` | `8081` | HTTP TCP 埠。 |
 | `--path` | `/` | 網頁及 HLS 的 URL 前綴。 |
 | `--ffmpeg` | 從 PATH 搜尋 | FFmpeg 執行檔路徑。 |
+| `--hw-render` | 第一個可存取的 DRM Render Node | Linux VA-API GPU；`none` 強制使用軟體編解碼，或指定 `/dev/dri/renderD*`、`/dev/dri/by-path/pci-*-render`。 |
 | `--init-config` | — | 建立範例設定，不覆寫既有檔案。 |
 | `--max-streams` | `4` | 同時轉流的不同頻道上限。 |
 | `--encoder-threads` | `2` | 每個視訊編碼器使用的執行緒數。 |
@@ -496,7 +497,7 @@ python3 server.py --debug
 
 ## 給開發者
 
-**處理流程：** HTTP／HTTPS IPTV → FFmpeg → 單路 HLS（約 2 秒分段）→ 內建 Web 播放器。1080p 及以下來源原則上保持解析度；更高解析度按顯示比例縮小至 1920×1080 以內。視訊使用 x264 `superfast`、CRF 26、約 2.2 Mbps VBV；音訊為 AAC 80 kbps。播放器容許適度落後直播位置以吸收網路抖動，**並非低延遲直播方案**。
+**處理流程：** HTTP／HTTPS IPTV → FFmpeg → 單路 HLS（約 2 秒分段）→ 內建 Web 播放器。1080p 及以下來源原則上保持解析度；更高解析度按顯示比例縮小至 1920×1080 以內。視訊輸出固定 H.264、約 2.2 Mbps VBV；GPU 不可用時使用 x264 `superfast`、CRF 26。音訊為 AAC 80 kbps。播放器容許適度落後直播位置以吸收網路抖動，**並非低延遲直播方案**。
 
 目前不提供多畫質／ABR。HLS 播放器優先使用 hls.js，必要時才使用瀏覽器原生 HLS。轉流在最後一名觀眾離開後可立即釋放，異常斷線則由 idle timeout 保底回收。
 
