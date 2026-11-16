@@ -25,6 +25,7 @@ udisplayer 是一個自架的 IPTV Web 播放器。它從 **udpxy 或其他 HTTP
 - **分享同一條串流**：多人觀看同一頻道時，伺服器只需執行一個 FFmpeg 轉流程序。
 - **節省頻寬**：超過 1080p 的影像自動縮小；視訊統一輸出 H.264，音訊為 AAC。
 - **選用 GPU 加速**：Linux 支援 VA-API 硬體解碼及 H.264 硬體編碼；GPU 不可用時自動使用 CPU。
+- **支援 AVS 系列節目**：搭配具備對應解碼器的 FFmpeg，可收看 AVS、AVS+ 及 AVS2（含 Main10／4K）編碼的節目。**目前 AVS 系列視訊全部依靠 CPU 軟體解碼，不支援 AVS 硬體解碼**，對主機效能有一定要求，尤其 AVS2 4K／50fps 可能無法即時轉碼；後續 H.264 輸出仍可使用 VA-API 硬體編碼減輕負擔。
 - **自動回收資源**：沒有觀眾的頻道會停止轉流，避免長時間佔用 CPU。
 - **自訂存取路徑**：可以設定 URL 前綴，並接在 Nginx 等反向代理後方使用。
 
@@ -39,6 +40,8 @@ udisplayer 是一個自架的 IPTV Web 播放器。它從 **udpxy 或其他 HTTP
 | macOS **Apple Silicon／Intel** | 從原始碼執行 | Homebrew、Python、FFmpeg |
 
 **Linux 單檔版不包含 FFmpeg**，但已包含 Python 執行環境和前端檔案。macOS 目前沒有預先建置的發行版，請依下方 macOS 指引從原始碼啟動。
+
+> **AVS+／AVS2 軟體解碼：** 本專案提供對應的 FFmpeg／libdavs2 差異 Patch、固定版本建置腳本和使用指南，支援以 CPU 解碼 AVS、AVS+ AWQ 以及 AVS2 Main10，再輸出 H.264/AAC HLS。AVS 系列解碼目前依賴 CPU，即使啟用 VA-API 也不代表 AVS 硬體解碼；4K50 對主機效能要求高。詳見 [AVS 播放指南](docs/avs.md)、[Linux 解碼器建置指南](tools/avs/docs/BUILD-LINUX.md) 與 [第三方授權聲明](THIRD_PARTY_NOTICES.md)。不隨播放器打包 FFmpeg 二進位檔。
 
 從原始碼執行時，建議使用 **Python 3.12**（目前專案的測試環境）。服務核心不需要另外 `pip install` 套件；前端會在首次部署時下載固定版本的 hls.js 並製成 `index.html`。需要下載資料，**啟動後播放則不依賴第三方前端 CDN**。
 
@@ -243,6 +246,11 @@ cp channels.example.json channels.json
 | `url` | **必填**。伺服器可讀取的 HTTP／HTTPS 串流網址。 |
 | `group` | 選填。頻道的分類，例如「新聞」。 |
 | `logo` | 選填。本地圖片**檔名**，例如 `2.png`。 |
+| `decoder_threads` | 選填，1～16。單一頻道的 FFmpeg 輸入解碼執行緒數；可用於 AVS2 4K 測試，預設使用全域設定。 |
+| `codec_hint` | 選填，`cavs` 或 `avs2`。對已知 AVS 來源直接使用 CPU 解碼，避免不支援 AVS 的 VA-API 解碼嘗試；仍可使用 VA-API H.264 硬體編碼。 |
+| `avs2_skip_nonref` | 選填，`true`／`false`，預設 `false`；只允許 `codec_hint: "avs2"`。啟用客製化 10-bit AVS2 解碼器的實驗性非參考 B-frame 跳幀，需要額外進行畫質／長時穩定性驗證。 |
+| `video_scan` | 選填，`auto`（預設）或 `progressive`。只有實際影格已確認逐行掃描時才使用 `progressive`，以略過 `bwdif`；一般頻道保持自動去交錯。 |
+| `avs2_gpu_scale` | 選填，`true`／`false`，預設 `false`。僅允許 `codec_hint: "avs2"` 且 `video_scan: "progressive"`，GPU 濾鏡失敗會先回退 CPU 縮放並保留 H.264 硬編。四 vCPU 測試環境效能較差，不建議直接啟用。 |
 | `groups` | 選填的頂層欄位。控制分組顯示順序。 |
 
 放置 Logo 的方式：
@@ -488,6 +496,10 @@ python3 server.py --ffmpeg /完整路徑/ffmpeg
 
 例如 macOS 可用 `command -v ffmpeg` 確認位置。指定的 FFmpeg 路徑如果無效，程式**不會**偷偷退回其他版本。
 
+**AVS+／AVS2 頻道無法解碼，或 4K AVS2 CPU 過載**
+
+這和一般 H.264／H.265 頻道的解碼支援不同。要使用含 AWQ 的 AVS+ 或 10-bit 的 AVS2，可能需要獨立建置的客製化 FFmpeg；`udisplayer` 不會自動替你補上。請依 [AVS 節目播放指南](docs/avs.md) 檢查建置、`cavs`／`libdavs2`、實際解碼樣本、CPU 執行緒、實驗性跳幀開關與授權限制，避免直接修改正式系統 FFmpeg。
+
 **提示找不到 `index.html` 或 `vendor/lock.json`**
 
 這通常代表從原始碼執行時漏掉首次建置：
@@ -530,6 +542,7 @@ python3 server.py --debug
 | `--init-config` | — | 建立範例設定，不覆寫既有檔案。 |
 | `--max-streams` | `4` | 同時轉流的不同頻道上限。 |
 | `--encoder-threads` | `2` | 每個視訊編碼器使用的執行緒數。 |
+| `--decoder-threads` | `2` | 每路來源解碼器的預設執行緒數；4K AVS2 可測試 `4`，也能在單一頻道設定覆蓋。 |
 | `--startup-timeout` | `30` 秒 | 等待首次可播放串流的時間。 |
 | `--idle-timeout` | `60` 秒 | 頻道無活動後自動回收。 |
 | `--cache-dir` | 系統暫存目錄 | 放置暫存 HLS 分段。 |
@@ -539,7 +552,11 @@ python3 server.py --debug
 
 ## 給開發者
 
-**處理流程：** HTTP／HTTPS IPTV → FFmpeg → 單路 HLS（約 2 秒分段）→ 內建 Web 播放器。1080p 及以下來源原則上保持解析度；更高解析度按顯示比例縮小至 1920×1080 以內。視訊輸出固定 H.264、約 2.2 Mbps VBV；GPU 不可用時使用 x264 `superfast`、CRF 26。音訊為 AAC 80 kbps。播放器容許適度落後直播位置以吸收網路抖動，**並非低延遲直播方案**。
+**處理流程：** HTTP／HTTPS IPTV → FFmpeg → 單路 HLS（約 2 秒分段）→ 內建 Web 播放器。1080p 及以下來源原則上保持解析度；更高解析度按顯示比例縮小至 1920×1080 以內。**輸出幀率最高 30fps**；30fps 及以下維持原幀率，50／59.94／60fps 來源分別降至 25／29.97／30fps。降幀發生在解碼後、縮放與編碼前，不代表可省略解碼參考影格。視訊輸出固定 H.264、約 2.2 Mbps VBV；GPU 不可用時使用 x264 `superfast`、CRF 26。音訊為 AAC 80 kbps。播放器容許適度落後直播位置以吸收網路抖動，**並非低延遲直播方案**。
+
+若以 CPU 軟解 AVS2 4K／50fps 且同時軟編 H.264，可先比較 `--decoder-threads 4 --encoder-threads 2` 與預設雙 2 執行緒的效能。CLI 的 `--decoder-threads` 是全服務預設；為了不增加其他普通頻道的資源消耗，**建議僅對 4K AVS2 頻道**在 `channels.json` 加入可選的 `"decoder_threads": 4`（合法值 1～16）。該頻道的值優先於全服務預設，H.264 編碼仍可維持 2 執行緒。多路同時播放時應依 vCPU 數、其它工作負載及實際轉碼速度調整。**增加執行緒不能保證 4K50 即時轉碼。**
+
+**AVS／AVS+／AVS2 支援：** udisplayer **不包含完整 FFmpeg／libdavs2 原始碼或二進位檔**，只呼叫使用者自行安裝的外部 FFmpeg CLI。專案提供自己的 AWQ／AVS2 差異修補、固定上游版本的建置腳本與驗證測試，集中於 **[`tools/avs/`](tools/avs/README.md)**。使用者執行建置腳本時才會從第三方原作者的 Git 倉庫取得其 Patch 與參考資料，並先核對 SHA-256；原始第三方 AVX2 修補不會存放於本專案。詳見 [AVS 外部媒體堆疊](docs/avs.md) 與 [第三方授權聲明](THIRD_PARTY_NOTICES.md)。實驗性 AVS2 跳幀功能預設關閉。
 
 目前不提供多畫質／ABR。HLS 播放器優先使用 hls.js，必要時才使用瀏覽器原生 HLS。轉流在最後一名觀眾離開後可立即釋放，異常斷線則由 idle timeout 保底回收。
 

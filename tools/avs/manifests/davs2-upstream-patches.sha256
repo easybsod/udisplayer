@@ -1,0 +1,3 @@
+2e83a0f00092c58a4d5a3350ca6f48b1f411dbe088b9dd5c8812dcd2e5986f65  tools/patches/davs2-10bit/0001-enable-10bit-build-and-propagate-frame-packet-position.patch
+0b191c5701e4993917b0b7b7d690214ac8d20450e45859d7252b7c5012a2e346  tools/patches/davs2-10bit/0012-x86-build-avx-codepaths-as-dispatch-only.patch
+ecb5ab1cac801109fa40d7ff6724dde5f8f4ac62ecf9aa2c5ea6a42eb831d575  tools/patches/davs2-10bit/0013-x86-10bit-motion-compensation.patch

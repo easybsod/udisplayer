@@ -50,6 +50,8 @@ def main(argv=None) -> int:
                         help="同時轉流的頻道上限，預設 4")
     parser.add_argument("--encoder-threads", type=positive, default=2,
                         help="每個視訊編碼器的執行緒數，預設 2")
+    parser.add_argument("--decoder-threads", type=positive, default=2,
+                        help="每路來源視訊解碼器的執行緒數，預設 2；AVS2 4K 可測試 4")
     parser.add_argument("--debug", action="store_true",
                         help="輸出播放診斷埋點（segment、瀏覽器、FFmpeg、HLS 與來源健康）")
     args = parser.parse_args(argv)
@@ -83,7 +85,8 @@ def main(argv=None) -> int:
         settings = Settings(ffmpeg=ffmpeg, prefix=normalize_prefix(args.path),
                             host=args.host, port=args.port, startup_timeout=args.startup_timeout,
                             idle_timeout=args.idle_timeout, max_streams=args.max_streams,
-                            encoder_threads=args.encoder_threads, cache_dir=args.cache_dir,
+                            encoder_threads=args.encoder_threads,
+                            decoder_threads=args.decoder_threads, cache_dir=args.cache_dir,
                             debug=args.debug, hw_render=render, hw_decode=hw_decode,
                             hw_encode=hw_encode, hw_rc_mode=hw_rc_mode)
         server = AppServer(

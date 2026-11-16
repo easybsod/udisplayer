@@ -1,0 +1,122 @@
+diff --git a/libavcodec/cavs.c b/libavcodec/cavs.c
+index 05117a0..e5df37c 100644
+--- a/libavcodec/cavs.c
++++ b/libavcodec/cavs.c
+@@ -874,6 +874,7 @@ av_cold int ff_cavs_init(AVCodecContext *avctx)
+     ff_videodsp_init(&h->vdsp, 8);
+     ff_cavsdsp_init(&h->cdsp);
+     ff_init_scantable_permutation(permutation, h->cdsp.idct_perm);
++    memcpy(h->wq_permutation, permutation, sizeof(h->wq_permutation));
+     ff_permute_scantable(h->permutated_scantable, ff_zigzag_direct, permutation);
+     ff_permute_scantable(h->permutated_scantable_field, cavs_scan_field,
+                          permutation);
+diff --git a/libavcodec/cavs.h b/libavcodec/cavs.h
+index b51a5e6..ed23078 100644
+--- a/libavcodec/cavs.h
++++ b/libavcodec/cavs.h
+@@ -208,6 +208,10 @@ typedef struct AVSContext {
+     int field_mby;        ///< macroblock row of the current macroblock in it
+     int skip_mode_flag;   ///< select between skip_count or one skip_flag per MB
+     int aec_enable;       ///< the macroblock layer uses AEC (AVS1-P16)
++    int weighting_quant_flag; ///< AVS1-P16 8x8 adaptive weighted quantization
++    int chroma_delta_cb, chroma_delta_cr;
++    uint8_t wq_matrix[64]; ///< permuted to the IDCT's coefficient layout
++    uint8_t wq_permutation[64];
+     int aec_start;        ///< byte offset of the current AEC slice's payload
+     CAVSAECContext aec;   ///< AEC decoder state and contexts, clause 8.4
+     int prev_delta_qp;    ///< PreviousDeltaQP of clause 9.4.8, an AEC context
+diff --git a/libavcodec/cavsdec.c b/libavcodec/cavsdec.c
+index efcd156..884d890 100644
+--- a/libavcodec/cavsdec.c
++++ b/libavcodec/cavsdec.c
+@@ -600,7 +600,19 @@ static inline int dequant(AVSContext *h, int16_t *level_buf, uint8_t *run_buf,
+                    h->cur.poc, h->mbx, h->mby);
+             return AVERROR_INVALIDDATA;
+         }
+-        dst[scantab[pos]] = (level_buf[coeff_num] * mul + round) >> shift;
++        if (h->weighting_quant_flag) {
++            const int idx = scantab[pos];
++            int64_t v = ((int64_t)level_buf[coeff_num] * h->wq_matrix[idx]) >> 3;
++            v = (v * mul) >> 4;
++            v = (v + round) >> shift;
++            if (v < -8192 || v > 8191) {
++                av_log(h->avctx, AV_LOG_ERROR, "AWQ dequantization overflow\n");
++                return AVERROR_INVALIDDATA;
++            }
++            dst[idx] = v;
++        } else {
++            dst[scantab[pos]] = (level_buf[coeff_num] * mul + round) >> shift;
++        }
+     }
+     return 0;
+ }
+@@ -1136,16 +1148,17 @@ static int decode_residual(AVSContext *h, const struct dec_2dvlc *r,
+ 
+ static inline int decode_residual_chroma(AVSContext *h)
+ {
+-    const int qp = ff_cavs_chroma_qp[h->qp];
++    const int qp_cb = ff_cavs_chroma_qp[av_clip(h->qp + h->chroma_delta_cb, 0, 63)];
++    const int qp_cr = ff_cavs_chroma_qp[av_clip(h->qp + h->chroma_delta_cr, 0, 63)];
+     int ret;
+ 
+     if (h->cbp & (1 << 4)) {
+-        ret = decode_residual(h, chroma_dec, 0, 1, qp, h->cu, h->c_stride);
++        ret = decode_residual(h, chroma_dec, 0, 1, qp_cb, h->cu, h->c_stride);
+         if (ret < 0)
+             return ret;
+     }
+     if (h->cbp & (1 << 5)) {
+-        ret = decode_residual(h, chroma_dec, 0, 1, qp, h->cv, h->c_stride);
++        ret = decode_residual(h, chroma_dec, 0, 1, qp_cr, h->cv, h->c_stride);
+         if (ret < 0)
+             return ret;
+     }
+@@ -1959,10 +1972,45 @@ static int decode_pic(AVSContext *h)
+ 
+     /* AWQ parameters and aec_enable end the header (tables 21, 22) */
+     h->aec_enable = 0;
++    h->weighting_quant_flag = 0;
++    h->chroma_delta_cb = h->chroma_delta_cr = 0;
+     if (h->profile == AV_PROFILE_CAVS_BROADCASTING) {
+-        if (get_bits1(&h->gb)) { //weighting_quant_flag
+-            avpriv_request_sample(h->avctx, "Adaptive weighted quantization");
+-            return AVERROR_PATCHWELCOME;
++        h->weighting_quant_flag = get_bits1(&h->gb);
++        if (h->weighting_quant_flag) {
++            /* GB/T 20090.16-2016 Tables 21/22 and Clause 9.9. */
++            static const uint8_t wq_default[6] = {128, 98, 106, 116, 116, 128};
++            static const uint8_t wq_base1[6] = {135, 143, 143, 160, 160, 213};
++            static const uint8_t wq_base2[6] = {128, 98, 106, 116, 116, 128};
++            static const uint8_t model[3][64] = {
++#include "cavs_awq_models.inc"
++            };
++            uint8_t params[6];
++            int index, wq_model, i;
++            const uint8_t *base;
++
++            /* Broadcast bitstreams may set this reserved bit. */
++            skip_bits1(&h->gb);
++            if (!get_bits1(&h->gb)) { //chroma_quant_parameter_disable
++                h->chroma_delta_cb = get_se_golomb(&h->gb);
++                h->chroma_delta_cr = get_se_golomb(&h->gb);
++                if (h->chroma_delta_cb < -16 || h->chroma_delta_cb > 16 ||
++                    h->chroma_delta_cr < -16 || h->chroma_delta_cr > 16)
++                    return AVERROR_INVALIDDATA;
++            }
++            index = get_bits(&h->gb, 2);
++            wq_model = get_bits(&h->gb, 2);
++            if (index > 2 || wq_model > 2)
++                return AVERROR_INVALIDDATA;
++            base = index == 1 ? wq_base1 : index == 2 ? wq_base2 : wq_default;
++            for (i = 0; i < 6; i++) {
++                const int delta = index ? get_se_golomb(&h->gb) : 0;
++                const int value = base[i] + delta;
++                if (delta < -128 || delta > 127 || value < 0 || value > 255)
++                    return AVERROR_INVALIDDATA;
++                params[i] = value;
++            }
++            for (i = 0; i < 64; i++)
++                h->wq_matrix[h->wq_permutation[i]] = params[model[wq_model][i]];
+         }
+         h->aec_enable = get_bits1(&h->gb);
+     }

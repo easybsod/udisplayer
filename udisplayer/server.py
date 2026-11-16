@@ -52,7 +52,19 @@ class PlaybackSession:
     last_issue: float = 0
 
 
-def parse_request_path(target: str) -> tuple[str, str]:
+def parse_request_path(target: str, host: str | None = None) -> tuple[str, str]:
+    # HTTP/1.1 allows the absolute-form request target used by some clients
+    # and intermediary/proxy configurations. In particular, some mobile
+    # clients switch to this form after their initial HLS segment request.
+    # Accept it only for the same authority as the Host header; never act as
+    # a forward proxy for another server.
+    if target.startswith(("http://", "https://")):
+        absolute = urlsplit(target)
+        if (host is None or not absolute.netloc or absolute.netloc.lower() != host.strip().lower()
+                or absolute.username is not None or absolute.password is not None
+                or absolute.fragment):
+            raise ValueError("Invalid absolute request target")
+        target = (absolute.path or "/") + ("?" + absolute.query if absolute.query else "")
     if not target.startswith("/") or target.startswith("//") or "#" in target:
         raise ValueError("Invalid request target")
     if re.search(r"%(?![0-9a-fA-F]{2})|%(?:2f|5c|00)", target.split("?", 1)[0], re.I):
@@ -89,6 +101,10 @@ class AppServer(ThreadingHTTPServer):
                 entry["group"] = channel.group
             if channel.logo:
                 entry["logo"] = channel.logo
+            # Only disclose a harmless playback profile hint, not the IPTV
+            # source URL or any server-side encoder/decoder settings.
+            if channel.codec_hint in ("cavs", "avs2"):
+                entry["codec_hint"] = channel.codec_hint
             public["channels"].append(entry)
         self.config_json = json.dumps(public, ensure_ascii=False).encode()
         self.channel_ids = frozenset(c.id for c in config.channels)
@@ -401,7 +417,7 @@ class Handler(BaseHTTPRequestHandler):
             self.not_found()
 
     def route(self):
-        path, query = parse_request_path(self.path)
+        path, query = parse_request_path(self.path, self.headers.get("Host"))
         prefix = self.server.settings.prefix
         if prefix and path == prefix:
             self.respond(308, b"", extra={"Location": prefix + "/" + ("?" + query if query else "")})

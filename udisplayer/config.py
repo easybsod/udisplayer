@@ -23,6 +23,11 @@ class Channel:
     url: str
     group: str | None = None
     logo: str | None = None
+    decoder_threads: int | None = None
+    codec_hint: str | None = None
+    avs2_skip_nonref: bool = False
+    video_scan: str = "auto"
+    avs2_gpu_scale: bool = False
 
 
 @dataclass(frozen=True)
@@ -42,6 +47,7 @@ class Settings:
     idle_timeout: float = 60
     max_streams: int = 4
     encoder_threads: int = 2
+    decoder_threads: int = 2
     cache_dir: Path | None = None
     debug: bool = False
     hw_render: str | None = None
@@ -89,6 +95,11 @@ def read_config(path: Path) -> ChannelConfig:
             raise ValueError(f"第 {index} 個頻道必須是物件")
         cid, name, url = (entry.get(k) for k in ("id", "name", "url"))
         group, logo = entry.get("group"), entry.get("logo")
+        decoder_threads = entry.get("decoder_threads")
+        codec_hint = entry.get("codec_hint")
+        avs2_skip_nonref = entry.get("avs2_skip_nonref", False)
+        video_scan = entry.get("video_scan", "auto")
+        avs2_gpu_scale = entry.get("avs2_gpu_scale", False)
         if not isinstance(cid, int) or isinstance(cid, bool) or not CHANNEL_ID.fullmatch(str(cid)) or cid in seen:
             raise ValueError(f"第 {index} 個頻道的 id 必須是唯一正整數")
         if not isinstance(name, str) or not name.strip() or len(name.strip()) > 256:
@@ -103,6 +114,19 @@ def read_config(path: Path) -> ChannelConfig:
         if logo is not None:
             if not isinstance(logo, str) or not LOGO_FILE.fullmatch(logo):
                 raise ValueError(f"頻道 {cid} 的 logo 必須是 logos 目錄中的安全檔名")
+        if decoder_threads is not None:
+            if (not isinstance(decoder_threads, int) or isinstance(decoder_threads, bool)
+                    or not 1 <= decoder_threads <= 16):
+                raise ValueError(f"頻道 {cid} 的 decoder_threads 必須是 1 至 16 的整數")
+        if codec_hint not in (None, "cavs", "avs2"):
+            raise ValueError(f"頻道 {cid} 的 codec_hint 僅支援 cavs 或 avs2")
+        if type(avs2_skip_nonref) is not bool or (avs2_skip_nonref and codec_hint != "avs2"):
+            raise ValueError(f"頻道 {cid} 的 avs2_skip_nonref 必須是布林值，且只可用於 avs2")
+        if video_scan not in ("auto", "progressive") or not isinstance(video_scan, str):
+            raise ValueError(f"頻道 {cid} 的 video_scan 僅支援 auto 或 progressive")
+        if (type(avs2_gpu_scale) is not bool or
+                (avs2_gpu_scale and (codec_hint != "avs2" or video_scan != "progressive"))):
+            raise ValueError(f"頻道 {cid} 的 avs2_gpu_scale 必須是布林值，且只可用於已驗證逐行掃描的 avs2")
         try:
             parsed = urlsplit(url) if isinstance(url, str) else None
             valid = (parsed and parsed.scheme in ("http", "https") and parsed.hostname
@@ -114,7 +138,8 @@ def read_config(path: Path) -> ChannelConfig:
         if not valid:
             raise ValueError(f"頻道 {cid} 需要有效的 HTTP／HTTPS 串流網址")
         seen.add(cid)
-        result.append(Channel(cid, name.strip(), url, group, logo))
+        result.append(Channel(cid, name.strip(), url, group, logo, decoder_threads,
+                              codec_hint, avs2_skip_nonref, video_scan, avs2_gpu_scale))
 
     grouping_enabled = bool(normalized_groups or has_channel_group)
     groups = list(normalized_groups)
@@ -124,7 +149,9 @@ def read_config(path: Path) -> ChannelConfig:
                 groups.append(group)
         if any(channel.group is None for channel in result) and UNGROUPED not in groups:
             groups.append(UNGROUPED)
-        result = [Channel(c.id, c.name, c.url, c.group or UNGROUPED, c.logo) for c in result]
+        result = [Channel(c.id, c.name, c.url, c.group or UNGROUPED, c.logo,
+                          c.decoder_threads, c.codec_hint, c.avs2_skip_nonref,
+                          c.video_scan, c.avs2_gpu_scale) for c in result]
     return ChannelConfig(tuple(result), tuple(groups), grouping_enabled)
 
 

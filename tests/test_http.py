@@ -1,4 +1,5 @@
 import io
+import http.client
 import json
 import tempfile
 import threading
@@ -77,6 +78,30 @@ class HttpTests(unittest.TestCase):
     def request(self, path, method='GET', headers=None, data=None):
         return self.request_to(self.base, path, method=method, headers=headers, data=data)
 
+    def test_absolute_form_same_origin_requests_and_cross_origin_rejection(self):
+        # urllib converts absolute URLs back into origin-form; send the actual
+        # HTTP/1.1 absolute-form bytes that were observed on the production VM.
+        authority = f'127.0.0.1:{self.server.server_port}'
+        def raw(method, target):
+            conn = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=5)
+            try:
+                conn.putrequest(method, target, skip_host=True)
+                conn.putheader('Host', authority)
+                conn.endheaders()
+                response = conn.getresponse()
+                return response.status, response.read()
+            finally:
+                conn.close()
+        prefix = f'http://{authority}/tv/secret'
+        status, body = raw('GET', prefix + '/?channel=1')
+        self.assertEqual(status, 200)
+        self.assertIn(b'udisplayer', body)
+        status, body = raw('GET', prefix + '/hls/1/index.m3u8?session=abc')
+        self.assertEqual(status, 200)
+        self.assertIn(b'#EXTM3U', body)
+        status, _ = raw('GET', 'http://evil.example/tv/secret/')
+        self.assertEqual(status, 404)
+
     def test_secret_prefix_guards_all_routes_and_errors(self):
         for path in ('/', '/index.html', '/channels.json', '/hls/1/index.m3u8',
                      '/tv/secretextra/', '/tv/%2e%2e/tv/secret/', '/tv/secret/../secret/'):
@@ -132,6 +157,33 @@ class HttpTests(unittest.TestCase):
                 },
             )
         self.assertEqual(status, 200)
+
+    def test_avs_client_playback_hint_does_not_expose_private_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, payload in (("index.html", "<html></html>"),
+                                  ("not-found.html", "404 Not Found\n")):
+                (root / name).write_text(payload)
+            (root / "logos").mkdir()
+            config = ChannelConfig((
+                Channel(1, "Generic", "http://example.com/1"),
+                Channel(2, "AVS+", "http://private.example/2", codec_hint="cavs"),
+                Channel(3, "AVS2", "http://private.example/3", codec_hint="avs2",
+                        decoder_threads=6, avs2_skip_nonref=True),
+            ), (), False)
+            server = AppServer(Settings(ffmpeg="/ignored", host="127.0.0.1", port=0),
+                               config, root / "index.html", root / "not-found.html",
+                               root / "logos", manager=FakeManager())
+            try:
+                channels = json.loads(server.config_json)["channels"]
+                self.assertNotIn("codec_hint", channels[0])
+                self.assertEqual(channels[1]["codec_hint"], "cavs")
+                self.assertEqual(channels[2]["codec_hint"], "avs2")
+                self.assertNotIn("url", server.config_json.decode())
+                self.assertNotIn("decoder_threads", server.config_json.decode())
+                self.assertNotIn("avs2_skip_nonref", server.config_json.decode())
+            finally:
+                server.server_close()
 
     def test_assets_playlist_segments_and_range_share_prefix(self):
         status, headers, html = self.request('/tv/secret/')

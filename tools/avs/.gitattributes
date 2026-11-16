@@ -1,0 +1,3 @@
+# Keep imported upstream patch bytes unchanged (including CRLF/tab formatting).
+# Git whitespace checks apply to project code/docs, not embedded diff payloads.
+*.patch -text -whitespace

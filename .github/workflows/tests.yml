@@ -1,0 +1,27 @@
+name: Tests and source integrity
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependency
+        run: python3 -m pip install Pillow==12.3.0
+      - name: Shell syntax and patch checksums
+        run: |
+          bash -n tools/avs/scripts/*.sh
+          cd tools/avs
+          sha256sum --check manifests/patches.sha256
+          ./scripts/check-local.sh
+      - name: Python unit tests
+        run: python3 -m unittest discover -s tests -v

@@ -189,6 +189,13 @@
     releaseUrl.searchParams.set('session', clientSession);
     const telemetryUrl = new URL('telemetry', base);
     const nativeSupport = Boolean(video.canPlayType('application/vnd.apple.mpegurl'));
+    // AVS+ broadcasts and CPU-decoded 4K AVS2 benefit from a larger steady
+    // buffer: network delivery is fast but 2 s fragments can arrive with
+    // timestamp holes and the 4K transcoder runs close to its CPU limit.
+    // This intentionally trades some live latency for fewer MSE stalls.
+    const avsStream = channel.codec_hint === 'cavs' || channel.codec_hint === 'avs2';
+    const liveDelay = avsStream ? 10 : 6;
+    const maxLiveLag = avsStream ? 26 : 15;
     // Prefer hls.js whenever Media Source / Managed Media Source is available.
     // Modern iOS can then use the same bounded buffering and recovery policy as
     // desktop browsers instead of bypassing it through native AVFoundation HLS.
@@ -309,8 +316,8 @@
       if (latest === null || !Number.isFinite(latest)) return false;
       const ranges = liveRange();
       const start = ranges.start(ranges.length - 1);
-      const target = Math.max(start + 0.05, latest - 6);
-      if (target >= latest || (!force && latest - video.currentTime <= 15)) return false;
+      const target = Math.max(start + 0.05, latest - liveDelay);
+      if (target >= latest || (!force && latest - video.currentTime <= maxLiveLag)) return false;
       try {
         video.currentTime = target;
         state.liveJumps++;
@@ -368,9 +375,12 @@
           timeoutRetry: {...retry}, errorRetry: {...retry}}});
         const hls = new Hls({
           preferManagedMediaSource: true,
-          lowLatencyMode: false, initialLiveManifestSize: 1,
-          liveSyncDuration: 6, liveMaxLatencyDuration: 15,
+          lowLatencyMode: false, initialLiveManifestSize: avsStream ? 3 : 1,
+          liveSyncDuration: liveDelay, liveMaxLatencyDuration: maxLiveLag,
           liveSyncOnStallIncrease: 0, maxLiveSyncPlaybackRate: 1,
+          // Permit small PES/segment timestamp gaps without treating every
+          // gap as a fatal buffer underflow on the iPhone ManagedMediaSource.
+          maxBufferHole: avsStream ? 0.5 : 0.1,
           maxBufferLength: 30, maxMaxBufferLength: 45, backBufferLength: 15,
           frontBufferFlushThreshold: 40, startLevel: 0, capLevelToPlayerSize: true,
           manifestLoadPolicy: policy(35000, 45000), playlistLoadPolicy: policy(35000, 45000),
@@ -515,7 +525,7 @@
       if (latest !== null) {
         if (Math.abs(latest - state.lastEdge) > 0.1) { state.lastEdge = latest; state.edgeAdvancedAt = now; }
         if (state.edgeAdvancedAt && now - state.edgeAdvancedAt > 30000) { scheduleRecovery('正在取得最新直播'); return; }
-        state.lagTicks = latest - video.currentTime > 15 ? state.lagTicks + 1 : 0;
+        state.lagTicks = latest - video.currentTime > maxLiveLag ? state.lagTicks + 1 : 0;
         if (state.lagTicks >= 2 && now - state.lastSeek > 5000) {
           lowerQuality();
           if (state.hls) state.hls.stopLoad();

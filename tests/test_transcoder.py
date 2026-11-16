@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from udisplayer.config import Channel, Settings
-from udisplayer.transcoder import StreamError, StreamManager, ffmpeg_command
+from udisplayer.transcoder import StreamError, StreamManager, ffmpeg_command, classify_source_event
 from udisplayer.transcoder import (backend_candidates, HW_DECODE_HW_ENCODE,
                                   SW_DECODE_HW_ENCODE, HW_DECODE_SW_ENCODE, SOFTWARE)
 
@@ -41,11 +41,24 @@ class TranscoderTests(unittest.TestCase):
     def setUp(self):
         self.channel = Channel(1, "Test", "http://127.0.0.1/live")
 
+    def test_source_events_separate_ts_cc_pts_dts_and_decoder_failures(self):
+        self.assertEqual(classify_source_event("[mpegts] continuity check failed for pid 256 expected 4 got 9"), "continuity")
+        self.assertEqual(classify_source_event("[mpegts] Invalid timestamps stream=0, pts=99, dts=101"), "timestamp")
+        self.assertEqual(classify_source_event("Non-monotonous DTS in output stream"), "timestamp")
+        self.assertEqual(classify_source_event("[mpegts] PES packet size mismatch"), "pes")
+        self.assertEqual(classify_source_event("[davs2] invalid pred mode 33"), "decoder_syntax")
+        self.assertEqual(classify_source_event("[mpegts] Packet corrupt (stream = 0, dts=300)"), "corrupt")
+        self.assertIsNone(classify_source_event("Frame decoded OK"))
+
     def test_ffmpeg_command_preserves_display_aspect_and_has_single_output(self):
-        settings = Settings(ffmpeg="/usr/bin/ffmpeg", encoder_threads=2)
+        settings = Settings(ffmpeg="/usr/bin/ffmpeg", encoder_threads=2,
+                            decoder_threads=4)
         command = ffmpeg_command(settings, self.channel, Path("/tmp/udisplayer-test"))
         joined = " ".join(command)
         self.assertIn("bwdif=mode=send_frame:parity=auto:deint=interlaced", joined)
+        self.assertIn("fps=fps='min(30,if(gte(source_fps,50),source_fps/2,source_fps))'", joined)
+        self.assertLess(joined.index("bwdif="), joined.index("fps=fps="))
+        self.assertLess(joined.index("fps=fps="), joined.index("scale=w="))
         self.assertIn("scale=w='max(2,trunc(iw*if(gt(sar,0),sar,1)/2)*2)'", joined)
         self.assertIn("setsar=1", joined)
         self.assertIn("scale=w='min(iw,1920)':h='min(ih,1080)'", joined)
@@ -54,8 +67,17 @@ class TranscoderTests(unittest.TestCase):
         self.assertNotIn("split=", joined)
         self.assertNotIn("-var_stream_map", command)
         self.assertEqual(command.count("-map"), 2)
-        self.assertEqual(command[command.index("-analyzeduration") + 1], "500000")
-        self.assertEqual(command[command.index("-probesize") + 1], "500000")
+        self.assertEqual(command[command.index("-analyzeduration") + 1], "4000000")
+        self.assertEqual(command[command.index("-probesize") + 1], "4000000")
+        self.assertEqual(command[command.index("-threads") + 1], "4")
+        self.assertEqual(command[command.index("-threads:v") + 1], "2")
+        override = ffmpeg_command(settings,
+                                  Channel(2, "AVS2", "http://127.0.0.1/avs2",
+                                          decoder_threads=6), Path("/tmp/avstwo"))
+        self.assertEqual(override[override.index("-threads") + 1], "6")
+        self.assertEqual(override[override.index("-threads:v") + 1], "2")
+        self.assertEqual(command[command.index("-fps_mode:v") + 1], "passthrough")
+        self.assertLess(command.index("-vf"), command.index("-fps_mode:v"))
         self.assertIn("2200000", command)
         self.assertIn("80000", command)
         self.assertIn("superfast", command)
@@ -90,6 +112,8 @@ class TranscoderTests(unittest.TestCase):
                 self.assertIn("discont_start", rendered)
                 self.assertIn("force_original_aspect_ratio=decrease", rendered)
                 self.assertIn("bwdif=mode=send_frame", rendered)
+                self.assertIn("fps=fps='min(30,if(gte(source_fps,50),source_fps/2,source_fps))'", rendered)
+                self.assertEqual(cmd[cmd.index("-fps_mode:v") + 1], "passthrough")
                 self.assertIn("-c:a aac", rendered)
                 self.assertIn("-f hls", rendered)
                 self.assertIn("-hls_time 2", rendered)
@@ -115,6 +139,117 @@ class TranscoderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "尚未驗證"):
             ffmpeg_command(Settings(**base), self.channel, Path("/tmp"),
                            backend=SW_DECODE_HW_ENCODE)
+
+    def test_avs_software_decode_preserves_vaapi_encode_without_failed_probe(self):
+        settings = Settings(ffmpeg="/usr/bin/ffmpeg", hw_render="/dev/dri/renderD128",
+                            hw_decode=True, hw_encode=True)
+        for codec in ('cavs', 'avs2'):
+            channel = Channel(408, codec, "http://127.0.0.1/live", codec_hint=codec)
+            self.assertEqual(backend_candidates(settings, channel),
+                             (SW_DECODE_HW_ENCODE, SOFTWARE))
+            command = ffmpeg_command(settings, channel, Path('/tmp/avs'),
+                                     backend=SW_DECODE_HW_ENCODE)
+            self.assertIn('h264_vaapi', command)
+            self.assertNotIn('-hwaccel', command)
+            with self.assertRaisesRegex(ValueError, 'AVS 軟體解碼'):
+                ffmpeg_command(settings, channel, Path('/tmp/avs'), backend=HW_DECODE_HW_ENCODE)
+        self.assertEqual(backend_candidates(Settings(ffmpeg='/usr/bin/ffmpeg'), channel),
+                         (SOFTWARE,))
+
+    def test_progressive_avs2_can_skip_deinterlace_without_changing_other_channels(self):
+        settings = Settings(ffmpeg="/usr/bin/ffmpeg", hw_render="/dev/dri/renderD128",
+                            hw_decode=True, hw_encode=True)
+        progress = Channel(2, "progressive AVS2", "https://example.org/live",
+                           codec_hint="avs2", video_scan="progressive")
+        interlace = Channel(3, "AVS+ interlaced", "https://example.org/live",
+                            codec_hint="cavs")
+        for ch in (progress, interlace):
+            command = ffmpeg_command(settings, ch, Path("/tmp/avstest"),
+                                     backend=SW_DECODE_HW_ENCODE)
+            filters = command[command.index("-vf") + 1]
+            self.assertEqual("bwdif=" in filters, ch is interlace)
+            self.assertIn("fps=fps=", filters)
+            self.assertIn("scale=w='max(2,trunc(iw*", filters)
+            self.assertIn("format=nv12,hwupload", filters)
+
+    def test_gpu_scale_is_opt_in_and_falls_back_to_cpu_scale(self):
+        settings = Settings(ffmpeg="/usr/bin/ffmpeg", hw_render="/dev/dri/renderD128",
+                            hw_decode=True, hw_encode=True)
+        ch = Channel(2, "progressive AVS2", "https://example.org/live",
+                     codec_hint="avs2", video_scan="progressive", avs2_gpu_scale=True)
+        gpu = ffmpeg_command(settings, ch, Path("/tmp/gpuscale"),
+                             backend=SW_DECODE_HW_ENCODE)
+        filters = gpu[gpu.index("-vf") + 1]
+        self.assertIn("hwupload,scale_vaapi=", filters)
+        self.assertNotIn("bwdif", filters)
+        self.assertNotIn("hwdownload", filters)
+        self.assertNotIn("scale=w=", filters)
+        self.assertIn("format=nv12", filters)
+        self.assertIn("h264_vaapi", gpu)
+        for backend in (SOFTWARE, SW_DECODE_HW_ENCODE):
+            cpu = ffmpeg_command(settings, ch, Path("/tmp/cpuscale"), backend=backend,
+                                 enable_gpu_scale=False)
+            self.assertIn("scale=w=", cpu[cpu.index("-vf") + 1])
+            self.assertNotIn("scale_vaapi", cpu[cpu.index("-vf") + 1])
+        self.assertNotIn("scale_vaapi", ffmpeg_command(
+            settings, ch, Path("/tmp/sw"), backend=SOFTWARE)[
+                ffmpeg_command(settings, ch, Path("/tmp/sw"),
+                               backend=SOFTWARE).index("-vf") + 1])
+
+    def test_gpu_scale_failure_preserves_hardware_encoder_and_sessions(self):
+        settings = Settings(ffmpeg="/usr/bin/ffmpeg", hw_render="/dev/dri/renderD128",
+                            hw_decode=True, hw_encode=True)
+        ch = Channel(2, "progressive AVS2", "https://example.org/live",
+                     codec_hint="avs2", video_scan="progressive", avs2_gpu_scale=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            commands = []
+            def spawn(cmd, **kwargs):
+                commands.append(cmd)
+                return FakeProcess()
+            with patch("udisplayer.transcoder.subprocess.Popen", side_effect=spawn):
+                manager = StreamManager(Settings(**{**settings.__dict__,
+                                                    'cache_dir': Path(tmp)}), (ch,))
+                try:
+                    with manager.lock:
+                        stream = manager._ensure_locked(2, session='abcdef')
+                        self.assertIn("scale_vaapi=", ' '.join(commands[0]))
+                        token = stream.token
+                        stream.errors.append("Failed to configure output pad on Parsed_scale_vaapi_1")
+                        self.assertTrue(manager._recover_locked(2, stream, "exit"))
+                        self.assertEqual(stream.token, token)
+                        self.assertIn('abcdef', stream.sessions)
+                        self.assertEqual(stream.backend_index, 0)
+                        self.assertTrue(stream.gpu_scale_disabled)
+                        self.assertNotIn("scale_vaapi=", ' '.join(commands[1]))
+                        self.assertIn("h264_vaapi", commands[1])
+                        stream.errors.append("h264_vaapi encoding error")
+                        self.assertTrue(manager._recover_locked(2, stream, "exit"))
+                        self.assertEqual(stream.backends[stream.backend_index], SOFTWARE)
+                finally:
+                    manager.close()
+
+    def test_avs2_skip_nonref_environment_is_set_only_for_opted_channel(self):
+        settings = Settings(ffmpeg='/usr/bin/ffmpeg', hw_render='/dev/dri/renderD128',
+                            hw_decode=True, hw_encode=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            captured = []
+            def spawn(command, **kwargs):
+                captured.append(kwargs['env'])
+                return FakeProcess()
+            avs2 = Channel(408, 'AVS2', 'http://127.0.0.1/live', codec_hint='avs2',
+                           avs2_skip_nonref=True)
+            avsplus = Channel(400, 'AVS+', 'http://127.0.0.1/live', codec_hint='cavs')
+            with patch.dict(os.environ, {}, clear=True), patch('udisplayer.transcoder.subprocess.Popen', side_effect=spawn):
+                manager = StreamManager(Settings(**{**settings.__dict__, 'cache_dir': Path(tmp)}),
+                                        (avs2, avsplus))
+                try:
+                    with manager.lock:
+                        manager._ensure_locked(408)
+                        manager._ensure_locked(400)
+                finally:
+                    manager.close()
+            self.assertEqual(captured[0]['UDISPLAYER_AVS2_SKIP_NONREF'], '1')
+            self.assertNotIn('UDISPLAYER_AVS2_SKIP_NONREF', captured[1])
 
     def test_hardware_exit_restarts_with_same_token_and_software_last(self):
         with tempfile.TemporaryDirectory() as tmp:

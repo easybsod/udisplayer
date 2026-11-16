@@ -1,0 +1,578 @@
+diff --git a/build/linux/configure b/build/linux/configure
+index e2f2639..36677a2 100755
+--- a/build/linux/configure
++++ b/build/linux/configure
+@@ -572,2 +571,0 @@ case $host_os in
+-        # TODO: Fix compiling error under mac osx (force disabled now)
+-        asm="no"
+diff --git a/source/common/common.h b/source/common/common.h
+index a7fbfa4..8ce9e3f 100644
+--- a/source/common/common.h
++++ b/source/common/common.h
+@@ -938,0 +939,9 @@ struct davs2_mgr_t {
++    /* Optional, per-decoder AVS2 10-bit non-reference B-picture omission.
++     * Updated under mutex_mgr; bounded to avoid unbounded growth on broken
++     * streams or discontinuous timestamps. */
++    int                 skip_nonref_enabled;
++    unsigned            skipped_poc_count;
++    int                 skipped_pocs[64];
++    uint64_t            skipped_poc_total;
++    uint64_t            skipped_poc_fallbacks;
++
+@@ -956,0 +966,3 @@ struct davs2_mgr_t {
++/* Called only while mutex_mgr is held. */
++void davs2_skip_advance_output_locked(davs2_mgr_t *mgr);
++
+diff --git a/source/common/davs2.cc b/source/common/davs2.cc
+index 1bf99ff..840a9fc 100644
+--- a/source/common/davs2.cc
++++ b/source/common/davs2.cc
+@@ -243,0 +244,30 @@ int has_new_output_frame(davs2_mgr_t *mgr, davs2_t *h)
++/* Discard old registry entries and consume intentionally omitted POCs.
++ * Caller owns mutex_mgr. Non-reference pictures are never used for future
++ * reconstruction, but their display positions must still advance. */
++void davs2_skip_advance_output_locked(davs2_mgr_t *mgr)
++{
++    unsigned i, write = 0;
++    int advanced;
++
++    if (!mgr->skip_nonref_enabled || mgr->outpics.output < 0)
++        return;
++
++    do {
++        advanced = 0;
++        for (i = 0; i < mgr->skipped_poc_count; i++) {
++            if (mgr->skipped_pocs[i] == mgr->outpics.output) {
++                mgr->outpics.output++;
++                advanced = 1;
++                break;
++            }
++        }
++    } while (advanced);
++
++    /* Keep only POCs that might still be needed after a discontinuity. */
++    for (i = 0; i < mgr->skipped_poc_count; i++) {
++        if (mgr->skipped_pocs[i] >= mgr->outpics.output)
++            mgr->skipped_pocs[write++] = mgr->skipped_pocs[i];
++    }
++    mgr->skipped_poc_count = write;
++}
++
+@@ -256,0 +287 @@ davs2_outpic_t *output_list_get_one_output_picture(davs2_mgr_t *mgr)
++        davs2_skip_advance_output_locked(mgr);
+@@ -298,0 +330 @@ davs2_outpic_t *output_list_get_one_output_picture(davs2_mgr_t *mgr)
++            davs2_skip_advance_output_locked(mgr);
+@@ -449,0 +482 @@ davs2_decoder_open(davs2_param_t *param)
++    const char *skip_env;
+@@ -491,0 +525,3 @@ davs2_decoder_open(davs2_param_t *param)
++    /* Disabled unless expressly requested by the caller's environment. */
++    skip_env = getenv("UDISPLAYER_AVS2_SKIP_NONREF");
++    mgr->skip_nonref_enabled = skip_env && strcmp(skip_env, "1") == 0;
+@@ -602,0 +639,44 @@ int decoder_decode_es_unit(davs2_mgr_t *mgr, es_unit_t *es_unit)
++        /* Only omit an explicitly non-reference B picture at odd display
++         * POC for verified 10-bit 50/60fps streams. Keep full decoding on
++         * other streams or when the bounded registry is full. */
++        if (mgr->skip_nonref_enabled &&
++            h->seq_info.head.internal_bit_depth == 10 &&
++            h->seq_info.head.frame_rate >= 49.0f &&
++            h->seq_info.head.frame_rate <= 60.5f &&
++            h->i_frame_type == AVS2_B_SLICE &&
++            !h->rps.refered_by_others && (h->i_poc & 1)) {
++            int omit = 0;
++            unsigned i;
++            davs2_thread_mutex_lock(&mgr->mutex_mgr);
++            davs2_skip_advance_output_locked(mgr);
++            if (h->i_poc >= mgr->outpics.output &&
++                mgr->skipped_poc_count < sizeof(mgr->skipped_pocs) / sizeof(mgr->skipped_pocs[0])) {
++                int duplicate = 0;
++                for (i = 0; i < mgr->skipped_poc_count; i++) {
++                    if (mgr->skipped_pocs[i] == h->i_poc) {
++                        duplicate = 1;
++                        break;
++                    }
++                }
++                if (!duplicate) {
++                    mgr->skipped_pocs[mgr->skipped_poc_count++] = h->i_poc;
++                    /* The skipped picture still carries RPS retirement
++                     * commands. Update pending removals before the next header. */
++                    task_apply_pending_removals(mgr);
++                    mgr->num_frames_to_remove = h->rps.num_to_remove;
++                    for (unsigned k = 0; k < (unsigned)h->rps.num_to_remove; k++)
++                        mgr->coi_remove_frame[k] = h->i_coi - h->rps.remove_pic[k];
++                    mgr->skipped_poc_total++;
++                    omit = 1;
++                }
++            }
++            if (!omit)
++                mgr->skipped_poc_fallbacks++;
++            davs2_thread_mutex_unlock(&mgr->mutex_mgr);
++            if (omit) {
++                davs2_thread_mutex_unlock(&mgr->mutex_aec);
++                task_unload_packet(h, es_unit);
++                return 0;
++            }
++        }
++
+@@ -785,0 +866,6 @@ davs2_decoder_close(void *decoder)
++    if (mgr->skip_nonref_enabled)
++        davs2_log(mgr, DAVS2_LOG_INFO,
++                  "non-reference B-frame omissions: %llu, fallbacks: %llu",
++                  (unsigned long long)mgr->skipped_poc_total,
++                  (unsigned long long)mgr->skipped_poc_fallbacks);
++
+diff --git a/source/common/decoder.h b/source/common/decoder.h
+index cf8c360..e0b00eb 100644
+--- a/source/common/decoder.h
++++ b/source/common/decoder.h
+@@ -57,0 +58,2 @@ void davs2_write_a_frame(davs2_picture_t *pic, davs2_frame_t *frame);
++#define task_apply_pending_removals FPFX(task_apply_pending_removals)
++void task_apply_pending_removals(davs2_mgr_t *mgr);
+diff --git a/source/common/header.cc b/source/common/header.cc
+index 7938d35..7d4e44e 100644
+--- a/source/common/header.cc
++++ b/source/common/header.cc
+@@ -1078,0 +1079,3 @@ int task_set_sequence_head(davs2_mgr_t *mgr, davs2_seq_t *seq)
++        int newformat = mgr->seq_info.head.internal_bit_depth != seq->head.internal_bit_depth ||
++                        mgr->seq_info.head.frame_rate_id != seq->head.frame_rate_id ||
++                        mgr->seq_info.head.profile_id != seq->head.profile_id;
+@@ -1079,0 +1083,3 @@ int task_set_sequence_head(davs2_mgr_t *mgr, davs2_seq_t *seq)
++        /* A format change invalidates all saved output positions. */
++        if (newformat)
++            mgr->skipped_poc_count = 0;
+@@ -1082,0 +1089 @@ int task_set_sequence_head(davs2_mgr_t *mgr, davs2_seq_t *seq)
++            mgr->skipped_poc_count = 0;
+@@ -1184,0 +1192,3 @@ int has_blocking(davs2_mgr_t *mgr)
++    /* The omitted display positions are not missing reconstruction tasks. */
++    davs2_skip_advance_output_locked(mgr);
++
+@@ -1233 +1243 @@ int has_blocking(davs2_mgr_t *mgr)
+-int task_get_references(davs2_t *h, int64_t pts, int64_t dts, int64_t pos)
++void task_apply_pending_removals(davs2_mgr_t *mgr)
+@@ -1235,3 +1245,2 @@ int task_get_references(davs2_t *h, int64_t pts, int64_t dts, int64_t pos)
+-    davs2_mgr_t    *mgr   = h->task_info.taskmgr;
+-    davs2_frame_t **dpb   = mgr->dpb;
+-    davs2_frame_t  *frame = NULL;
++    davs2_frame_t **dpb = mgr->dpb;
++    davs2_frame_t *frame;
+@@ -1240,10 +1249,2 @@ int task_get_references(davs2_t *h, int64_t pts, int64_t dts, int64_t pos)
+-#define IS_VALID_FRAME(frame) ((frame)->i_coi != INVALID_FRAME && (frame)->i_poc != INVALID_FRAME)
+-
+-    davs2_thread_mutex_lock(&mgr->mutex_mgr);
+-
+-    h->fdec = NULL;
+-    h->num_of_references = 0;
+-    for (i = 0; i < AVS2_MAX_REFS; i++) {
+-        h->fref[i] = NULL;
+-    }
+-
++    /* Invoked under mgr->mutex_mgr. A skipped B picture must preserve the
++     * reference picture set removal commands exactly like a decoded picture. */
+@@ -1256 +1257 @@ int task_get_references(davs2_t *h, int64_t pts, int64_t dts, int64_t pos)
+-            if (!IS_VALID_FRAME(frame)) {
++            if (!(frame->i_coi != INVALID_FRAME && frame->i_poc != INVALID_FRAME)) {
+@@ -1279,0 +1281,21 @@ int task_get_references(davs2_t *h, int64_t pts, int64_t dts, int64_t pos)
++}
++
++int task_get_references(davs2_t *h, int64_t pts, int64_t dts, int64_t pos)
++{
++    davs2_mgr_t    *mgr   = h->task_info.taskmgr;
++    davs2_frame_t **dpb   = mgr->dpb;
++    davs2_frame_t  *frame = NULL;
++    int i, j;
++
++#define IS_VALID_FRAME(frame) ((frame)->i_coi != INVALID_FRAME && (frame)->i_poc != INVALID_FRAME)
++
++    davs2_thread_mutex_lock(&mgr->mutex_mgr);
++
++    h->fdec = NULL;
++    h->num_of_references = 0;
++    for (i = 0; i < AVS2_MAX_REFS; i++) {
++        h->fref[i] = NULL;
++    }
++
++    task_apply_pending_removals(mgr);
++
+diff --git a/source/common/memory.cc b/source/common/memory.cc
+index ff20514..de8dd3c 100644
+--- a/source/common/memory.cc
++++ b/source/common/memory.cc
+@@ -60,0 +61,6 @@ void davs2_memory_init(uint32_t cpuid, ao_funcs_t* pf)
++#if HIGH_BIT_DEPTH && ARCH_X86_64
++        // 10-bit 4K pictures are large; system memcpy has AVX/ERMS dispatch.
++        // Legacy MMX copies are slower and need an MMX->SSE state transition.
++        pf->fast_memcpy     = memcpy;
++        pf->memcpy_aligned  = memcpy;
++#else
+@@ -62,0 +69 @@ void davs2_memory_init(uint32_t cpuid, ao_funcs_t* pf)
++#endif
+diff --git a/source/common/sao.cc b/source/common/sao.cc
+index cbbbae9..d3b0955 100644
+--- a/source/common/sao.cc
++++ b/source/common/sao.cc
+@@ -672,0 +673,8 @@ void davs2_sao_init(uint32_t cpuid, ao_funcs_t *fh)
++#else
++        /* Optional only. The 10-bit AVX2 kernels are faster in isolation,
++         * but did not improve representative whole-stream CPU throughput. */
++        const char *opt = getenv("UDISPLAYER_AVS2_AVX2_SAO");
++        if (opt && strcmp(opt, "1") == 0) {
++            fh->sao_block_bo = SAO_on_block_bo_avx2_10bit;
++            fh->sao_filter_eo[SAO_TYPE_EO_0] = SAO_on_block_eo_0_avx2_10bit;
++        }
+diff --git a/source/common/vec/intrinsic.h b/source/common/vec/intrinsic.h
+index e6ba94c..4a71e37 100644
+--- a/source/common/vec/intrinsic.h
++++ b/source/common/vec/intrinsic.h
+@@ -415,0 +416,6 @@ void SAO_on_block_eo_135_sse128_10bit(pel_t* dst, int i_dst, const pel_t* src, i
++#define SAO_on_block_eo_0_avx2_10bit FPFX(SAO_on_block_eo_0_avx2_10bit)
++void SAO_on_block_eo_0_avx2_10bit(pel_t *dst, int dst_stride, const pel_t *src, int src_stride,
++                                   int width, int height, int bit_depth, const int *available, const int *offset);
++#define SAO_on_block_bo_avx2_10bit FPFX(SAO_on_block_bo_avx2_10bit)
++void SAO_on_block_bo_avx2_10bit(pel_t *dst, int dst_stride, const pel_t *src, int src_stride,
++                                 int width, int height, int bit_depth, const sao_param_t *param);
+diff --git a/source/common/vec/intrinsic_sao.cc b/source/common/vec/intrinsic_sao.cc
+index 365a69b..37e6314 100644
+--- a/source/common/vec/intrinsic_sao.cc
++++ b/source/common/vec/intrinsic_sao.cc
+@@ -767,2 +767,4 @@ void SAO_on_block_bo_sse128(pel_t *p_dst, int i_dst,
+-void SAO_on_block_eo_0_sse128_10bit(pel_t* dst, int i_dst, const pel_t* src, int i_src,
+-    int i_block_w, int i_block_h, int bit_depth, const int* lcu_avail, const int* sao_offset)
++void SAO_on_block_eo_0_sse128_10bit(pel_t *dst, int dst_stride, const pel_t *src,
++                                      int src_stride, int width, int height,
++                                      int bit_depth, const int *available,
++                                      const int *offset)
+@@ -770,76 +772,11 @@ void SAO_on_block_eo_0_sse128_10bit(pel_t* dst, int i_dst, const pel_t* src, int
+-    int start_x, end_x;
+-    int x, y;
+-
+-    int max_pixel = (1 << bit_depth) - 1;
+-    __m128i off0, off1, off2, off3, off4;
+-    __m128i s0, s1, s2;
+-    __m128i t0, t1, t2, t3, t4, etype;
+-    __m128i c0, c1, c2, c3, c4;
+-    __m128i mask;
+-    __m128i min_val = _mm_setzero_si128();
+-    __m128i max_val = _mm_set1_epi16(max_pixel);
+-
+-    int end_x_8;
+-    c0 = _mm_set1_epi16(-2);
+-    c1 = _mm_set1_epi16(-1);
+-    c2 = _mm_set1_epi16(0);
+-    c3 = _mm_set1_epi16(1);
+-    c4 = _mm_set1_epi16(2);
+-
+-    off0 = _mm_set1_epi16((pel_t)sao_offset[0]);
+-    off1 = _mm_set1_epi16((pel_t)sao_offset[1]);
+-    off2 = _mm_set1_epi16((pel_t)sao_offset[2]);
+-    off3 = _mm_set1_epi16((pel_t)sao_offset[3]);
+-    off4 = _mm_set1_epi16((pel_t)sao_offset[4]);
+-    start_x = lcu_avail[SAO_L] ? 0 : 1;
+-    end_x = lcu_avail[SAO_R] ? i_block_w : (i_block_w - 1);
+-    end_x_8 = end_x - ((end_x - start_x) & 0x07);
+-
+-    mask = _mm_load_si128((__m128i*)(intrinsic_mask[end_x - end_x_8 - 1]));
+-    if (i_block_w == 4) {
+-
+-
+-        for (y = 0; y < i_block_h; y++) {
+-            //diff = src[start_x] - src[start_x - 1];
+-            //leftsign = diff > 0 ? 1 : (diff < 0 ? -1 : 0);
+-            s0 = _mm_loadu_si128((__m128i*) & src[start_x - 1]);
+-            s1 = _mm_srli_si128(s0, 2);
+-            s2 = _mm_srli_si128(s0, 4);
+-
+-            t3 = _mm_min_epu16(s0, s1);
+-            t1 = _mm_cmpeq_epi16(t3, s0);
+-            t2 = _mm_cmpeq_epi16(t3, s1);
+-            t0 = _mm_subs_epi16(t2, t1); //leftsign
+-
+-            t3 = _mm_min_epu16(s1, s2);
+-            t1 = _mm_cmpeq_epi16(t3, s1);
+-            t2 = _mm_cmpeq_epi16(t3, s2);
+-            t3 = _mm_subs_epi16(t1, t2); //rightsign
+-
+-            etype = _mm_adds_epi16(t0, t3); //edgetype
+-
+-            t0 = _mm_cmpeq_epi16(etype, c0);
+-            t1 = _mm_cmpeq_epi16(etype, c1);
+-            t2 = _mm_cmpeq_epi16(etype, c2);
+-            t3 = _mm_cmpeq_epi16(etype, c3);
+-            t4 = _mm_cmpeq_epi16(etype, c4);
+-
+-            t0 = _mm_and_si128(t0, off0);
+-            t1 = _mm_and_si128(t1, off1);
+-            t2 = _mm_and_si128(t2, off2);
+-            t3 = _mm_and_si128(t3, off3);
+-            t4 = _mm_and_si128(t4, off4);
+-
+-            t0 = _mm_adds_epi16(t0, t1);
+-            t2 = _mm_adds_epi16(t2, t3);
+-            t0 = _mm_adds_epi16(t0, t4);
+-            t0 = _mm_adds_epi16(t0, t2);//get offset
+-
+-            t1 = _mm_adds_epi16(t0, s1);
+-            t1 = _mm_min_epi16(t1, max_val);
+-            t1 = _mm_max_epi16(t1, min_val);
+-            _mm_maskmoveu_si128(t1, mask, (char*)(dst));
+-
+-            dst += i_dst;
+-            src += i_src;
+-        }
++    const int start_x = available[2] ? 0 : 1;  // SAO_L
++    const int end_x = available[3] ? width : (width - 1);  // SAO_R
++    const int maxval = (1 << bit_depth) - 1;
++    const __m128i plus1 = _mm_set1_epi16(1);
++    const __m128i plus2 = _mm_set1_epi16(2);
++    const __m128i zero = _mm_setzero_si128();
++    const __m128i limit = _mm_set1_epi16((short)maxval);
++    __m128i classes[5], corrections[5];
++    for (int i = 0; i < 5; ++i) {
++        classes[i] = _mm_set1_epi16(i);
++        corrections[i] = _mm_set1_epi16((short)offset[i]);
+@@ -847,53 +784,27 @@ void SAO_on_block_eo_0_sse128_10bit(pel_t* dst, int i_dst, const pel_t* src, int
+-    else {
+-
+-        for (y = 0; y < i_block_h; y++) {
+-            //diff = src[start_x] - src[start_x - 1];
+-            //leftsign = diff > 0 ? 1 : (diff < 0 ? -1 : 0);
+-            for (x = start_x; x < end_x; x += 8) {
+-                s0 = _mm_loadu_si128((__m128i*) & src[x - 1]);
+-                s1 = _mm_loadu_si128((__m128i*) & src[x]);
+-                s2 = _mm_loadu_si128((__m128i*) & src[x + 1]);
+-
+-                t3 = _mm_min_epu16(s0, s1);
+-                t1 = _mm_cmpeq_epi16(t3, s0);
+-                t2 = _mm_cmpeq_epi16(t3, s1);
+-                t0 = _mm_subs_epi16(t2, t1); //leftsign
+-
+-                t3 = _mm_min_epu16(s1, s2);
+-                t1 = _mm_cmpeq_epi16(t3, s1);
+-                t2 = _mm_cmpeq_epi16(t3, s2);
+-                t3 = _mm_subs_epi16(t1, t2); //rightsign
+-
+-                etype = _mm_adds_epi16(t0, t3); //edgetype
+-
+-                t0 = _mm_cmpeq_epi16(etype, c0);
+-                t1 = _mm_cmpeq_epi16(etype, c1);
+-                t2 = _mm_cmpeq_epi16(etype, c2);
+-                t3 = _mm_cmpeq_epi16(etype, c3);
+-                t4 = _mm_cmpeq_epi16(etype, c4);
+-
+-                t0 = _mm_and_si128(t0, off0);
+-                t1 = _mm_and_si128(t1, off1);
+-                t2 = _mm_and_si128(t2, off2);
+-                t3 = _mm_and_si128(t3, off3);
+-                t4 = _mm_and_si128(t4, off4);
+-
+-                t0 = _mm_adds_epi16(t0, t1);
+-                t2 = _mm_adds_epi16(t2, t3);
+-                t0 = _mm_adds_epi16(t0, t4);
+-                t0 = _mm_adds_epi16(t0, t2);//get offset
+-
+-                t1 = _mm_adds_epi16(t0, s1);
+-                t1 = _mm_min_epi16(t1, max_val);
+-                t1 = _mm_max_epi16(t1, min_val);
+-
+-                if (x != end_x_8) {
+-                    _mm_storeu_si128((__m128i*)(dst + x), t1);
+-                }
+-                else {
+-                    _mm_maskmoveu_si128(t1, mask, (char*)(dst + x));
+-                    break;
+-                }
+-            }
+-            dst += i_dst;
+-            src += i_src;
++    for (int y = 0; y < height; ++y) {
++        int x = start_x;
++        for (; x + 8 <= end_x; x += 8) {
++            const __m128i left = _mm_loadu_si128((const __m128i *)(src + x - 1));
++            const __m128i center = _mm_loadu_si128((const __m128i *)(src + x));
++            const __m128i right = _mm_loadu_si128((const __m128i *)(src + x + 1));
++            const __m128i positive = _mm_add_epi16(
++                _mm_and_si128(_mm_cmpgt_epi16(center, left), plus1),
++                _mm_and_si128(_mm_cmpgt_epi16(center, right), plus1));
++            const __m128i negative = _mm_add_epi16(
++                _mm_and_si128(_mm_cmpgt_epi16(left, center), plus1),
++                _mm_and_si128(_mm_cmpgt_epi16(right, center), plus1));
++            const __m128i index = _mm_add_epi16(plus2, _mm_sub_epi16(positive, negative));
++            __m128i delta = zero;
++            for (int i = 0; i < 5; ++i)
++                delta = _mm_or_si128(delta, _mm_and_si128(
++                    _mm_cmpeq_epi16(index, classes[i]), corrections[i]));
++            const __m128i sum = _mm_adds_epi16(center, delta);
++            _mm_storeu_si128((__m128i *)(dst + x),
++                _mm_max_epi16(zero, _mm_min_epi16(limit, sum)));
++        }
++        for (; x < end_x; ++x) {
++            const int center = src[x];
++            const int category = 2 + (center > src[x-1]) - (center < src[x-1])
++                                   + (center > src[x+1]) - (center < src[x+1]);
++            const int sum = center + offset[category];
++            dst[x] = (pel_t)(sum < 0 ? 0 : sum > maxval ? maxval : sum);
+@@ -900,0 +812,2 @@ void SAO_on_block_eo_0_sse128_10bit(pel_t* dst, int i_dst, const pel_t* src, int
++        src += src_stride;
++        dst += dst_stride;
+@@ -924,4 +837,4 @@ void SAO_on_block_bo_sse128_10bit(pel_t* dst, int i_dst, const pel_t* src, int i
+-    off0 = _mm_set1_epi16(saoBlkParam->offset[0]);
+-    off1 = _mm_set1_epi16(saoBlkParam->offset[1]);
+-    off2 = _mm_set1_epi16(saoBlkParam->offset[2]);
+-    off3 = _mm_set1_epi16(saoBlkParam->offset[3]);
++    off0 = _mm_set1_epi16(saoBlkParam->offset[saoBlkParam->startBand]);
++    off1 = _mm_set1_epi16(saoBlkParam->offset[(saoBlkParam->startBand + 1) & 31]);
++    off2 = _mm_set1_epi16(saoBlkParam->offset[saoBlkParam->startBand2]);
++    off3 = _mm_set1_epi16(saoBlkParam->offset[(saoBlkParam->startBand2 + 1) & 31]);
+@@ -961 +874 @@ void SAO_on_block_bo_sse128_10bit(pel_t* dst, int i_dst, const pel_t* src, int i
+-        mask = _mm_load_si128((const __m128i*)intrinsic_mask[(i_block_w & 7) - 1]);
++        mask = (i_block_w & 7) ? _mm_load_si128((const __m128i*)intrinsic_mask[(i_block_w & 7) - 1]) : _mm_setzero_si128();
+diff --git a/source/common/vec/intrinsic_sao_avx2.cc b/source/common/vec/intrinsic_sao_avx2.cc
+index 2ad2521..be3d4a6 100644
+--- a/source/common/vec/intrinsic_sao_avx2.cc
++++ b/source/common/vec/intrinsic_sao_avx2.cc
+@@ -686 +686,97 @@ void SAO_on_block_bo_avx2(pel_t *p_dst, int i_dst,
+-#endif // !HIGH_BIT_DEPTH
+\ No newline at end of file
++#endif // !HIGH_BIT_DEPTH
++
++#if HIGH_BIT_DEPTH
++/* Process sixteen 10-bit samples at once. AVX2 is dispatched at runtime by
++ * davs2_sao_init; no AVX2 instructions are used on legacy x86-64 CPUs.
++ * Full keyed offsets are essential because the two BO ranges may overlap. */
++void SAO_on_block_bo_avx2_10bit(pel_t *dst, int dst_stride, const pel_t *src,
++                                 int src_stride, int width, int height,
++                                 int bit_depth, const sao_param_t *param)
++{
++    const int shift = bit_depth - NUM_SAO_BO_CLASSES_IN_BIT;
++    const int maxval = (1 << bit_depth) - 1;
++    const int bands[4] = {param->startBand, (param->startBand + 1) & 31,
++                          param->startBand2, (param->startBand2 + 1) & 31};
++    __m256i select[4], offset[4];
++    const __m128i shiftcount = _mm_cvtsi32_si128(shift);
++    const __m256i zero = _mm256_setzero_si256();
++    const __m256i upper = _mm256_set1_epi16((short)maxval);
++    for (int i = 0; i < 4; ++i) {
++        select[i] = _mm256_set1_epi16((short)bands[i]);
++        offset[i] = _mm256_set1_epi16((short)param->offset[bands[i]]);
++    }
++    for (int y = 0; y < height; ++y) {
++        int x = 0;
++        for (; x + 16 <= width; x += 16) {
++            const __m256i pixels = _mm256_loadu_si256((const __m256i *)(src + x));
++            const __m256i bucket = _mm256_srl_epi16(pixels, shiftcount);
++            __m256i correction = zero;
++            for (int i = 0; i < 4; ++i) {
++                correction = _mm256_or_si256(correction,
++                    _mm256_and_si256(_mm256_cmpeq_epi16(bucket, select[i]), offset[i]));
++            }
++            __m256i result = _mm256_adds_epi16(pixels, correction);
++            result = _mm256_max_epi16(zero, _mm256_min_epi16(upper, result));
++            _mm256_storeu_si256((__m256i *)(dst + x), result);
++        }
++        for (; x < width; ++x) {
++            int value = (int)src[x] + param->offset[src[x] >> shift];
++            dst[x] = (pel_t)(value < 0 ? 0 : value > maxval ? maxval : value);
++        }
++        dst += dst_stride;
++        src += src_stride;
++    }
++}
++
++/* Horizontal EO on 16 unsigned 10-bit samples. The reference pixels are in
++ * the separate unfiltered SAO plane, so vector reads cannot see our writes.
++ * Left/right boundary checks are shared with the generic implementation. */
++void SAO_on_block_eo_0_avx2_10bit(pel_t *dst, int dst_stride, const pel_t *src,
++                                   int src_stride, int width, int height,
++                                   int bit_depth, const int *available, const int *offset)
++{
++    const int start_x = available[2] ? 0 : 1;  // SAO_L
++    const int end_x = available[3] ? width : (width - 1);  // SAO_R
++    const int maxval = (1 << bit_depth) - 1;
++    const __m256i plus1 = _mm256_set1_epi16(1);
++    const __m256i plus2 = _mm256_set1_epi16(2);
++    const __m256i zero = _mm256_setzero_si256();
++    const __m256i limit = _mm256_set1_epi16((short)maxval);
++    __m256i classes[5], corrections[5];
++    for (int i = 0; i < 5; ++i) {
++        classes[i] = _mm256_set1_epi16(i);
++        corrections[i] = _mm256_set1_epi16((short)offset[i]);
++    }
++    for (int y = 0; y < height; ++y) {
++        int x = start_x;
++        for (; x + 16 <= end_x; x += 16) {
++            const __m256i left = _mm256_loadu_si256((const __m256i *)(src + x - 1));
++            const __m256i center = _mm256_loadu_si256((const __m256i *)(src + x));
++            const __m256i right = _mm256_loadu_si256((const __m256i *)(src + x + 1));
++            const __m256i positive = _mm256_add_epi16(
++                _mm256_and_si256(_mm256_cmpgt_epi16(center, left), plus1),
++                _mm256_and_si256(_mm256_cmpgt_epi16(center, right), plus1));
++            const __m256i negative = _mm256_add_epi16(
++                _mm256_and_si256(_mm256_cmpgt_epi16(left, center), plus1),
++                _mm256_and_si256(_mm256_cmpgt_epi16(right, center), plus1));
++            const __m256i index = _mm256_add_epi16(plus2, _mm256_sub_epi16(positive, negative));
++            __m256i delta = zero;
++            for (int i = 0; i < 5; ++i)
++                delta = _mm256_or_si256(delta, _mm256_and_si256(
++                    _mm256_cmpeq_epi16(index, classes[i]), corrections[i]));
++            const __m256i sum = _mm256_adds_epi16(center, delta);
++            _mm256_storeu_si256((__m256i *)(dst + x),
++                _mm256_max_epi16(zero, _mm256_min_epi16(limit, sum)));
++        }
++        for (; x < end_x; ++x) {
++            const int center = src[x];
++            const int category = 2 + (center > src[x-1]) - (center < src[x-1])
++                                   + (center > src[x+1]) - (center < src[x+1]);
++            const int sum = center + offset[category];
++            dst[x] = (pel_t)(sum < 0 ? 0 : sum > maxval ? maxval : sum);
++        }
++        src += src_stride;
++        dst += dst_stride;
++    }
++}
++#endif // HIGH_BIT_DEPTH
+diff --git a/source/test/test.c b/source/test/test.c
+index 6c58bc1..d398488 100644
+--- a/source/test/test.c
++++ b/source/test/test.c
+@@ -162,0 +163,36 @@ void output_decoded_frame(davs2_picture_t *pic, davs2_seq_info_t *headerset, int
++    if (getenv("UDISPLAYER_AVS2_TEST_HASH") != NULL) {
++        unsigned long long h = 1469598103934665603ULL;
++        int y, x;
++        for (y = 0; y < pic->lines[0]; y += 89) {
++            const unsigned char *row = pic->planes[0] + (long long)y * pic->strides[0];
++            for (x = 0; x < pic->widths[0]; x += 97) {
++                unsigned int v;
++                if (pic->bytes_per_sample == 2) v = ((const unsigned short *)row)[x];
++                else v = row[x];
++                h = (h ^ v) * 1099511628211ULL;
++            }
++        }
++        fprintf(stderr, "UDISPLAYER_AVS2_SAMPLE_HASH poc=%d type=%d hash=%016llx\n", pic->pic_order_count, pic->type, h);
++    }
++    if (getenv("UDISPLAYER_AVS2_FULL_HASH") != NULL) {
++        /* Hash every visible byte of every plane; never include row padding. */
++        unsigned long long h = 1469598103934665603ULL;
++        int plane, line, x;
++        for (plane = 0; plane < pic->num_planes; plane++) {
++            const int row_bytes = pic->widths[plane] * pic->bytes_per_sample;
++            for (line = 0; line < pic->lines[plane]; line++) {
++                const unsigned char *row = pic->planes[plane] +
++                    (long long)line * pic->strides[plane];
++                for (x = 0; x + 8 <= row_bytes; x += 8) {
++                    unsigned long long word;
++                    memcpy(&word, row + x, sizeof(word));
++                    h = (h ^ word) * 1099511628211ULL;
++                }
++                for (; x < row_bytes; x++) {
++                    h = (h ^ row[x]) * 1099511628211ULL;
++                }
++            }
++        }
++        fprintf(stderr, "UDISPLAYER_AVS2_FULL_HASH poc=%d type=%d hash=%016llx\n",
++                pic->pic_order_count, pic->type, h);
++    }
+diff --git a/version.sh b/version.sh
+index d5c4150..de37c2b 100755
+--- a/version.sh
++++ b/version.sh
+@@ -18 +18 @@ if [ -d .git ] && command -v git >/dev/null 2>&1 ; then
+-    VER_R=`git rev-list --count origin/master`
++    VER_R=`git rev-list --count origin/master 2>/dev/null || echo 0`

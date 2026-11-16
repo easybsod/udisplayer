@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -19,10 +20,24 @@ LOG = logging.getLogger("udisplayer")
 SOURCE_EVENT_PATTERNS = (
     ("timeout", re.compile(r"tim(?:e|ed) ?out|i/o timeout|rw_timeout", re.I)),
     ("connection", re.compile(r"connection (?:reset|refused|closed)|broken pipe|end of file", re.I)),
-    ("corrupt", re.compile(r"corrupt|invalid data|error while decoding", re.I)),
+    # Explicit continuity and timestamp anomalies outrank generic corruption.
+    # A "Packet corrupt" warning alone does not establish a TS CC error.
     ("continuity", re.compile(r"continuity check|packet loss|missing packet", re.I)),
-    ("timestamp", re.compile(r"non[- ]monoton|timestamp|\b(?:dts|pts)\b.*(?:invalid|out of order)", re.I)),
+    ("timestamp", re.compile(r"non[- ]monoton|invalid timestamps?|"
+                              r"\b(?:dts|pts)\b.*(?:invalid|out of order)|"
+                              r"pts\s*[<>=]+\s*dts", re.I)),
+    ("pes", re.compile(r"PES packet size mismatch|PES header|PES packet", re.I)),
+    ("decoder_syntax", re.compile(r"invalid sequence header|invalid pred mode|"
+                                   r"AEC picture without a slice header|"
+                                   r"invalid intra_chroma|invalid CU", re.I)),
+    ("corrupt", re.compile(r"corrupt|invalid data|error while decoding", re.I)),
 )
+
+
+def classify_source_event(message: str) -> str | None:
+    """Conservative FFmpeg classification: never infer TS CC from corruption."""
+    return next((name for name, pattern in SOURCE_EVENT_PATTERNS
+                 if pattern.search(message)), None)
 
 SOURCE_TERMINAL_ERRORS = re.compile(
     r"tim(?:e|ed) ?out|connection (?:reset|refused|closed)|broken pipe|"
@@ -56,7 +71,12 @@ HW_DECODE_SW_ENCODE = "vaapi_decode"
 SOFTWARE = "software"
 
 
-def backend_candidates(settings: Settings) -> tuple[str, ...]:
+def backend_candidates(settings: Settings, channel: Channel | None = None) -> tuple[str, ...]:
+    # AVS+/AVS2 decoding is not supported by VA-API on this pipeline. Avoid
+    # trying the hardware decoder, timing out, and reconnecting the live source
+    # just to fall back to software decoding. Retain hardware H.264 encoding.
+    if channel is not None and channel.codec_hint in ("cavs", "avs2"):
+        return (SW_DECODE_HW_ENCODE, SOFTWARE) if settings.hw_render and settings.hw_encode else (SOFTWARE,)
     if not settings.hw_render:
         return (SOFTWARE,)
     if settings.hw_decode and settings.hw_encode:
@@ -77,10 +97,11 @@ class StreamError(Exception):
 
 def ffmpeg_command(settings: Settings, channel: Channel, directory: Path,
                    *, backend: str = SOFTWARE, start_number: int | None = None,
-                   discontinuity: bool = False) -> list[str]:
+                   discontinuity: bool = False,
+                   enable_gpu_scale: bool = True) -> list[str]:
     # Preserve source resolution up to 1080p. Larger sources are downscaled
-    # inside 1920x1080, then encoded as progressive H.264/AAC for broad browser
-    # compatibility and smoother Internet playback.
+    # inside 1920x1080, cap output at 30 fps, then encode as progressive
+    # H.264/AAC for broad browser compatibility and smoother Internet playback.
     start_number = str(int(time.time() // 2) if start_number is None else start_number)
     hardware_decode = backend in (HW_DECODE_HW_ENCODE, HW_DECODE_SW_ENCODE)
     hardware_encode = backend in (HW_DECODE_HW_ENCODE, SW_DECODE_HW_ENCODE)
@@ -88,8 +109,40 @@ def ffmpeg_command(settings: Settings, channel: Channel, directory: Path,
         raise ValueError("不支援的轉碼管線")
     if (hardware_decode and not settings.hw_decode) or (hardware_encode and not settings.hw_encode):
         raise ValueError("尚未驗證要求的硬體轉碼能力")
+    if hardware_decode and channel.codec_hint in ("cavs", "avs2"):
+        raise ValueError("此頻道標記為 AVS 軟體解碼，不能使用 VA-API 解碼")
     if (hardware_decode or hardware_encode) and not settings.hw_render:
         raise ValueError("硬體轉碼缺少 DRM Render Node")
+    # GPU scaling is an experimental *opt-in* for other GPUs. On the measured
+    # four-vCPU AVS2 host the extra 4K upload was 6–11% slower than CPU scale;
+    # keep CPU scaling the default even when hardware H.264 encoding is used.
+    gpu_scale = (enable_gpu_scale and channel.avs2_gpu_scale
+                 and channel.video_scan == "progressive"
+                 and channel.codec_hint == "avs2"
+                 and backend == SW_DECODE_HW_ENCODE)
+    deinterlace = ("" if channel.video_scan == "progressive" else
+                   "bwdif=mode=send_frame:parity=auto:deint=interlaced,")
+    frame_rate = "fps=fps='min(30,if(gte(source_fps,50),source_fps/2,source_fps))'"
+    # Only when the source is confirmed progressive and GPU scale is explicitly
+    # requested: 4K -> GPU upload -> VA-API scaling and 10-bit/8-bit conversion
+    # -> h264_vaapi. Do not download frames or upload them a second time.
+    if gpu_scale:
+        video_filters = (
+            frame_rate + ",format=nv12,hwupload,"
+            "scale_vaapi=w=1920:h=1080:format=nv12:mode=fast:"
+            "force_original_aspect_ratio=decrease:force_divisible_by=2:reset_sar=1"
+        )
+    else:
+        video_filters = (
+            ("scale_vaapi=format=nv12,hwdownload,format=nv12," if hardware_decode else "")
+            + deinterlace + frame_rate + ","
+            "scale=w='max(2,trunc(iw*if(gt(sar,0),sar,1)/2)*2)':"
+            "h='max(2,trunc(ih/2)*2)':flags=fast_bilinear,setsar=1,"
+            "scale=w='min(iw,1920)':h='min(ih,1080)':"
+            "force_original_aspect_ratio=decrease:force_divisible_by=2:"
+            "flags=fast_bilinear"
+            + (",format=nv12,hwupload" if hardware_encode else ",format=yuv420p")
+        )
     command = [settings.ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "warning"]
     if settings.debug:
         # FFmpeg's machine-readable progress stream is emitted on stdout only in
@@ -103,21 +156,26 @@ def ffmpeg_command(settings: Settings, channel: Channel, directory: Path,
                     "-hwaccel_output_format", "vaapi"]
     command += [
         "-y", "-rw_timeout", "10000000", "-fflags", "+discardcorrupt",
-        "-analyzeduration", "500000", "-probesize", "500000",
-        "-threads", str(settings.encoder_threads), "-i", channel.url,
+        # 500 kB / 0.5 s often misses the AVS+/AVS2 sequence header after
+        # joining live MPEG-TS mid-GOP. These are upper bounds; FFmpeg can
+        # finish probing sooner when it identifies streams successfully.
+        "-analyzeduration", "4000000", "-probesize", "4000000",
+        # Decoder thread count is independent of encoder workers. AVS2 4K
+        # often benefits from more decoder threads without increasing x264's
+        # own thread count. Preserve the historical default of two.
+        "-threads", str(channel.decoder_threads or settings.decoder_threads), "-i", channel.url,
         "-map", "0:v:0", "-map", "0:a:0", "-sn", "-dn",
         # Some broadcast sources use non-square pixels (for example 720x576
         # with SAR 16:15 for a 4:3 picture). First bake SAR into the coded width
         # so browsers receive square pixels with the correct DAR. Then cap the
         # square-pixel result inside 1920x1080; <=1080p sources remain unchanged.
-        "-vf", (("scale_vaapi=format=nv12,hwdownload,format=nv12," if hardware_decode else "")
-                + "bwdif=mode=send_frame:parity=auto:deint=interlaced,"
-                "scale=w='max(2,trunc(iw*if(gt(sar,0),sar,1)/2)*2)':"
-                "h='max(2,trunc(ih/2)*2)':flags=fast_bilinear,setsar=1,"
-                "scale=w='min(iw,1920)':h='min(ih,1080)':"
-                "force_original_aspect_ratio=decrease:force_divisible_by=2:"
-                "flags=fast_bilinear"
-                + (",format=nv12,hwupload" if hardware_encode else ",format=yuv420p")),
+        # Drop frames after deinterlacing but before scaling / encoding. Preserve
+        # rates <=30 fps, halve 50/59.94/60 fps for even frame cadence, and cap
+        # any higher rates at 30 fps. The decoder still handles reference frames.
+        "-vf", video_filters,
+        # fps already owns the output cadence. Do not let a second FFmpeg
+        # sync stage duplicate frames to fill start-time gaps in live TV.
+        "-fps_mode:v", "passthrough",
         # superfast leaves enough realtime headroom for 1080i + bwdif on the
         # production 2-vCPU host. A fixed CCTV-5 sample benchmark improved from
         # about 1.09x (veryfast) to 1.58x while staying near the same 2.2 Mbps VBV.
@@ -173,6 +231,7 @@ class Stream:
     encode_failed: bool = False
     error_lock: threading.Lock = field(default_factory=threading.Lock)
     error_reader: threading.Thread | None = None
+    gpu_scale_disabled: bool = False
 
 
 class StreamManager:
@@ -197,10 +256,7 @@ class StreamManager:
                 # Source URLs may contain credentials. Keep them out of logs.
                 cleaned = line.strip().replace(stream.channel.url, "[source]")
                 cleaned = re.sub(r"https?://\S+", "[source]", cleaned)[:500]
-                category = next(
-                    (name for name, pattern in SOURCE_EVENT_PATTERNS if pattern.search(cleaned)),
-                    None,
-                )
+                category = classify_source_event(cleaned)
                 with stream.error_lock:
                     if stream.process is process:
                         stream.errors.append(cleaned)
@@ -321,13 +377,20 @@ class StreamManager:
                     if (m := re.fullmatch(r"segment_(\d+)\.ts", path.name))]
         stream.start_number = max(int(time.time() // 2), stream.start_number + 1,
                                   max(existing, default=0) + 1)
+        environment = os.environ.copy()
+        if stream.channel.avs2_skip_nonref:
+            # Opt in for this AVS2 channel's decoder process only. The
+            # patched libdavs2 still verifies bit depth, fps and RPS safety.
+            environment["UDISPLAYER_AVS2_SKIP_NONREF"] = "1"
         process = subprocess.Popen(
             ffmpeg_command(self.settings, stream.channel, stream.directory,
                            backend=backend, start_number=stream.start_number,
-                           discontinuity=discontinuity),
+                           discontinuity=discontinuity,
+                           enable_gpu_scale=not stream.gpu_scale_disabled),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE if self.settings.debug else subprocess.DEVNULL,
             stderr=subprocess.PIPE,
+            env=environment,
             text=True, errors="replace",
         )
         stream.process = process
@@ -340,7 +403,11 @@ class StreamManager:
         reader.start()
         if self.settings.debug:
             threading.Thread(target=self._read_progress, args=(stream, process), daemon=True).start()
-        LOG.info("channel=%s transcoder=%s pid=%s", stream.channel.id, backend, process.pid)
+        LOG.info("channel=%s transcoder=%s gpu_scale=%s progressive=%s pid=%s",
+                 stream.channel.id, backend,
+                 bool(stream.channel.avs2_gpu_scale and not stream.gpu_scale_disabled
+                      and backend == SW_DECODE_HW_ENCODE),
+                 stream.channel.video_scan == "progressive", process.pid)
 
     def _recover_locked(self, cid: int, stream: Stream, reason: str) -> bool:
         """Disable only the failing acceleration stage of this channel."""
@@ -365,6 +432,30 @@ class StreamManager:
         errors = "\n".join(messages)
         decoder_issue = bool(DECODE_ERRORS.search(errors))
         encoder_issue = bool(ENCODE_ERRORS.search(errors))
+        # If a newer GPU rejects GPU scaling or frame upload, retry within
+        # the *same* VA-API encoder backend using the proven CPU scale path.
+        # Do not downgrade working H.264 hardware encoding merely because a
+        # scale_vaapi filter was unavailable or failed to negotiate a format.
+        if (old == SW_DECODE_HW_ENCODE and stream.channel.avs2_gpu_scale
+                and not stream.gpu_scale_disabled
+                and decoder_issue and not encoder_issue):
+            if stream.process.poll() is None:
+                stream.process.terminate()
+                try:
+                    stream.process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    stream.process.kill()
+                    stream.process.wait(timeout=3)
+            stream.gpu_scale_disabled = True
+            try:
+                self._launch(stream, discontinuity=True)
+            except OSError as exc:
+                LOG.warning("channel=%s gpu_scale_fallback spawn_error=%s", cid,
+                            type(exc).__name__)
+                return False
+            LOG.warning("channel=%s gpu_scale_fallback to=cpu_scale+h264_vaapi reason=%s",
+                        cid, reason)
+            return True
         # When FFmpeg identifies a specific failing stage, keep the other
         # stage accelerated. For generic failures, try software decoding first
         # while preserving the verified H.264 encoder.
@@ -437,7 +528,7 @@ class StreamManager:
         directory = self.root / token
         directory.mkdir(parents=True, exist_ok=False)
         stream = Stream(channel, token, directory, None, now, now,
-                        backends=backend_candidates(self.settings))
+                        backends=backend_candidates(self.settings, channel))
         try:
             self._launch(stream, discontinuity=False)
         except OSError as exc:
