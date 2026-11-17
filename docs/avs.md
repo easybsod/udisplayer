@@ -136,7 +136,7 @@ AVS+ 版本至少應有 `cavs`；包含 AVS2 的版本還應有 `libdavs2`。`va
 
 ## 5. 在 `udisplayer` 中試播 AVS 頻道
 
-現在已回到**`udisplayer` 主專案根目錄**。確認已有透過 `--init-config` 或其他方式建立的 `channels.json`，並且頻道是**伺服器可存取**的 HTTP／HTTPS URL（例如經 udpxy 轉出的 MPEG-TS）。現有轉碼程式預期來源同時包含視訊與音訊，只有影像、沒有音訊的來源可能因 `-map 0:a:0` 而失敗。
+現在已回到**`udisplayer` 主專案根目錄**。確認已有透過 `--init-channel-list` 或其他方式建立的 `channels.json`，並且頻道是**伺服器可存取**的 HTTP／HTTPS URL（例如經 udpxy 轉出的 MPEG-TS）。現有轉碼程式預期來源同時包含視訊與音訊，只有影像、沒有音訊的來源可能因 `-map 0:a:0` 而失敗。
 
 對 AVS2 4K50，可以只在該頻道的 `channels.json` 物件加入 `decoder_threads`：
 
@@ -176,7 +176,7 @@ AVS+ 版本至少應有 `cavs`；包含 AVS2 的版本還應有 `libdavs2`。`va
 ```bash
 # 強制純軟體測試，避免 GPU 驅動／硬解相容性干擾
 python3 server.py \
-  --config channels.json \
+  --channel-list channels.json \
   --ffmpeg "$FFMPEG_AVS" \
   --host localhost --port 8081 \
   --hw-render none \
@@ -206,7 +206,7 @@ python3 server.py \
 
 ```bash
 UDISPLAYER_AVS2_SKIP_NONREF=1 python3 server.py \
-  --config channels.json --ffmpeg "$FFMPEG_AVS" \
+  --channel-list channels.json --ffmpeg "$FFMPEG_AVS" \
   --host localhost --port 8081 --hw-render none \
   --encoder-threads 2 --max-streams 1 --debug
 ```

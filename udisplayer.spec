@@ -16,6 +16,7 @@ analysis = Analysis(
     datas=[(str(root / 'index.html'), '.'),
            (str(root / 'web/not-found.html'), 'web'),
            (str(root / 'channels.example.json'), '.'),
+           (str(root / 'udisplayer.example.ini'), '.'),
            (str(root / 'THIRD_PARTY_NOTICES.md'), '.'),
            (str(root / 'licenses'), 'licenses'),
            (str(pillow_license), 'licenses/pillow')],

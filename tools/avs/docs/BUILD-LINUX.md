@@ -160,11 +160,11 @@ python3 scripts/verify_ffmpeg.py \
 
 ## 7. 在 udisplayer 啟動參數與頻道設定套用
 
-回到主專案根目錄，建立配置檔；若已有配置檔，`--init-config` 會拒絕覆寫，請保留現有頻道並只追加新項目：
+回到主專案根目錄，建立頻道列表；若已有檔案，`--init-channel-list` 會拒絕覆寫，請保留現有頻道並只追加新項目：
 
 ```bash
 cd ../..
-python3 server.py --config channels.json --init-config
+python3 server.py --channel-list channels.json --init-channel-list
 ```
 
 以下只展示格式，**沒有任何真實頻道、個人資料或內網資訊**。`example.org` 是保留的範例網域，不能拿來實際播放：
@@ -197,7 +197,7 @@ python3 server.py --config channels.json --init-config
 先用純軟體方式在本機驗收：
 
 ```bash
-python3 server.py --config channels.json \
+python3 server.py --channel-list channels.json \
   --ffmpeg "$AVS_PREFIX/bin/ffmpeg" \
   --host localhost --port 8081 \
   --hw-render none --max-streams 1 --debug
@@ -213,14 +213,14 @@ python3 server.py --config channels.json \
 
 ## 8. 套用至既有 systemd 服務與回退
 
-先備份現有 unit、drop-in 和 `channels.json`，並記下原本可用的 FFmpeg 路徑。透過 `systemctl cat udisplayer` 檢查原本的完整 `ExecStart`，**只替換 `--ffmpeg` 路徑**，保留其餘的 `--config`、`--path`、`--host`、GPU 和服務參數。
+先備份現有 unit、drop-in 和 `channels.json`，並記下原本可用的 FFmpeg 路徑。透過 `systemctl cat udisplayer` 檢查原本的完整 `ExecStart`，**只替換 `--ffmpeg` 路徑**，保留其餘的 `--channel-list`、`--path`、`--host`、GPU 和服務參數。舊版 `--config <channels.json>` 已改為 `--channel-list <channels.json>`，**新版 `--config` 僅接受伺服器 INI**；從舊版本升級時必須同步更名。
 
 systemd drop-in 若覆寫 `ExecStart`，必須先以 `ExecStart=` 清空後重寫**完整原命令**。以下只是示範結構，路徑與參數應由實際 unit 決定，**不可無條件覆蓋既有服務**：
 
 ```ini
 [Service]
 ExecStart=
-ExecStart=/usr/bin/python3 /srv/udisplayer/server.py --config /etc/udisplayer/channels.json --ffmpeg /opt/udisplayer-media/avs-main10-v1/bin/ffmpeg --host localhost --port 8081
+ExecStart=/usr/bin/python3 /srv/udisplayer/server.py --channel-list /etc/udisplayer/channels.json --ffmpeg /opt/udisplayer-media/avs-main10-v1/bin/ffmpeg --host localhost --port 8081
 ```
 
 ```bash

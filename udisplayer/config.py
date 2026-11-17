@@ -5,7 +5,7 @@ import os
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -14,6 +14,18 @@ CHANNEL_ID = re.compile(r"[1-9]\d{0,8}\Z")
 LOGO_FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 PREFIX_SEGMENT = re.compile(r"[A-Za-z0-9._~-]+\Z")
 UNGROUPED = "未分組"
+
+
+def available_cpu_threads() -> int:
+    """Logical CPUs available to this process, respecting CPU affinity."""
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            allowed = len(os.sched_getaffinity(0))
+            if allowed > 0:
+                return allowed
+        except OSError:
+            pass
+    return max(1, os.cpu_count() or 1)
 
 
 @dataclass(frozen=True)
@@ -46,8 +58,8 @@ class Settings:
     startup_timeout: float = 30
     idle_timeout: float = 60
     max_streams: int = 4
-    encoder_threads: int = 2
-    decoder_threads: int = 2
+    encoder_threads: int = field(default_factory=available_cpu_threads)
+    decoder_threads: int = field(default_factory=available_cpu_threads)
     cache_dir: Path | None = None
     debug: bool = False
     hw_render: str | None = None

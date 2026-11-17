@@ -30,6 +30,7 @@ def main():
                 "sha256": digest}
     (ROOT / "dist/build-info.json").write_text(json.dumps(metadata, indent=2) + "\n")
     shutil.copy2(ROOT / "channels.example.json", ROOT / "dist/channels.example.json")
+    shutil.copy2(ROOT / "udisplayer.example.ini", ROOT / "dist/udisplayer.example.ini")
     print(f"Built {output}")
 
 

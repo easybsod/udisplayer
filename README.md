@@ -51,7 +51,7 @@ udisplayer 是一個自架的 IPTV Web 播放器。它從 **udpxy 或其他 HTTP
 
 ```bash
 chmod +x udisplayer-linux-x86_64
-./udisplayer-linux-x86_64 --init-config
+./udisplayer-linux-x86_64 --init-channel-list
 ```
 
 這會在執行檔旁建立 `channels.json`，**不會覆寫既有設定**。接著按照[第 3 節](#3-設定電視頻道)填入你的頻道來源。
@@ -144,7 +144,7 @@ cd udisplayer
 ```bash
 python3 tools/fetch_vendor.py
 python3 tools/build_web.py
-python3 server.py --init-config
+python3 server.py --init-channel-list
 ```
 
 修改 `channels.json` 後，啟動：
@@ -181,7 +181,7 @@ cd udisplayer
 ```bash
 python3.12 tools/fetch_vendor.py
 python3.12 tools/build_web.py
-python3.12 server.py --init-config
+python3.12 server.py --init-channel-list
 ```
 
 5. 編輯 `channels.json`（見下節），再啟動：
@@ -208,7 +208,7 @@ IPTV／udpxy（內網）──HTTP──> udisplayer + FFmpeg ──HLS／HTTP�
 
 ## 3. 設定電視頻道
 
-預設會讀取專案根目錄（原始碼版）或執行檔旁（Linux 單檔版）的 `channels.json`。如果沒有執行 `--init-config`，也可以自行複製範例：
+預設會讀取 `server.py` 所在目錄（原始碼版）或執行檔旁（Linux 單檔版）的 `channels.json`。如果沒有執行 `--init-channel-list`，也可以自行複製範例：
 
 ```bash
 cp channels.example.json channels.json
@@ -263,7 +263,7 @@ udisplayer/
     └── 2.png
 ```
 
-設定中的 `"logo": "2.png"` 對應到 `logos/2.png`，不填或找不到圖片時會顯示預設圖標。如果使用 `--config /path/to/channels.json`，Logo 必須放在 `/path/to/logos/`。
+設定中的 `"logo": "2.png"` 對應到 `logos/2.png`，不填或找不到圖片時會顯示預設圖標。如果使用 `--channel-list /path/to/channels.json`，Logo 必須放在 `/path/to/logos/`。**`--channel-list` 支援絕對及相對路徑；相對路徑一律從 `server.py` 所在目錄（單檔版為執行檔所在目錄）解析，與執行指令時的工作目錄及 INI 所在目錄無關。**
 
 修改頻道名稱、網址、分組或 Logo 後，**重新啟動 udisplayer，並重新整理瀏覽器頁面**，變更才會生效。實際配置與 Logo 預設已被 `.gitignore` 排除，不會隨原始碼提交到 Git。
 
@@ -533,16 +533,18 @@ python3 server.py --debug
 
 | 參數 | 預設 | 說明 |
 | --- | --- | --- |
-| `--config` | `channels.json` | 頻道設定檔的完整路徑。 |
+| `--config` | 不使用 INI | 選填的伺服器 INI 配置檔；命令列選項優先於 INI。 |
+| `--channel-list` | `channels.json` | 頻道列表 JSON 路徑；相對於 `server.py` 所在目錄。 |
 | `--host` | `0.0.0.0` | 綁定 IP。 |
 | `--port` | `8081` | HTTP TCP 埠。 |
 | `--path` | `/` | 網頁及 HLS 的 URL 前綴。 |
 | `--ffmpeg` | 從 PATH 搜尋 | FFmpeg 執行檔路徑。 |
 | `--hw-render` | 第一個可存取的 DRM Render Node | Linux VA-API GPU；`none` 強制使用軟體編解碼，或指定 `/dev/dri/renderD*`、`/dev/dri/by-path/pci-*-render`。 |
-| `--init-config` | — | 建立範例設定，不覆寫既有檔案。 |
+| `--init-config` | — | 建立範例 `udisplayer.ini`；預設位於 `server.py` 旁，可用 `--config` 指定位置，不覆寫。 |
+| `--init-channel-list` | — | 建立範例 `channels.json`；位置由 `--channel-list` 或 INI 指定，不覆寫。 |
 | `--max-streams` | `4` | 同時轉流的不同頻道上限。 |
-| `--encoder-threads` | `2` | 每個視訊編碼器使用的執行緒數。 |
-| `--decoder-threads` | `2` | 每路來源解碼器的預設執行緒數；4K AVS2 可測試 `4`，也能在單一頻道設定覆蓋。 |
+| `--encoder-threads` | 自動偵測可用邏輯 CPU 數 | 每個軟體視訊編碼器使用的執行緒數；可指定正整數覆蓋。 |
+| `--decoder-threads` | 自動偵測可用邏輯 CPU 數 | 每路來源解碼器的預設執行緒數；可指定正整數或在單一頻道設定覆蓋。 |
 | `--startup-timeout` | `30` 秒 | 等待首次可播放串流的時間。 |
 | `--idle-timeout` | `60` 秒 | 頻道無活動後自動回收。 |
 | `--cache-dir` | 系統暫存目錄 | 放置暫存 HLS 分段。 |
@@ -550,11 +552,26 @@ python3 server.py --debug
 | `--version` | — | 顯示版本。 |
 | `--licenses` | — | 顯示第三方授權資訊。 |
 
+### INI 伺服器配置（選用）
+
+`udisplayer` 不需要 INI 也可以直接啟動，並繼續沿用 CLI 參數和內建預設值。若希望將 systemd 啟動參數集中管理，可以建立 INI：
+
+```bash
+python3 server.py --init-config
+python3 server.py --config ./udisplayer.ini
+```
+
+`--init-config` 會在 `server.py` 旁建立 `udisplayer.ini`，也可指定 `--config /etc/udisplayer.ini --init-config` 建立在其他位置，**不會覆寫既有檔案**。範例模板參見 [udisplayer.example.ini](udisplayer.example.ini)。systemd 可使用 `ExecStart=/usr/bin/python3.12 /opt/udisplayer/server.py --config /etc/udisplayer.ini`，但不會自動搜尋或載入 INI。
+
+INI 僅支援平面 `key = value`（不支援區段、引號、插值及 include），布林值僅可為 `true`／`false`，未知鍵、重複鍵和無效數值會中止啟動並指出檔案行號。相對 `ffmpeg` 和 `cache-dir` 路徑相對於 **INI 所在目錄**，但相對 `channel-list` **一律相對於 `server.py` 所在目錄**。命令列明確指定的選項會覆蓋 INI，未指定時依 INI 設定或內建預設值（包含 CPU 執行緒自動偵測）。
+
+**升級注意：** 舊版本的 `--config` 曾代表頻道 JSON；現在 `--config` 專指 INI，頻道 JSON 應改用 `--channel-list`。舊版 `--init-config` 用來建立頻道列表，現在應改用 `--init-channel-list`。部署新版時務必檢查 systemd 或其他服務啟動命令，勿直接把 `channels.json` 傳給 `--config`。
+
 ## 給開發者
 
 **處理流程：** HTTP／HTTPS IPTV → FFmpeg → 單路 HLS（約 2 秒分段）→ 內建 Web 播放器。1080p 及以下來源原則上保持解析度；更高解析度按顯示比例縮小至 1920×1080 以內。**輸出幀率最高 30fps**；30fps 及以下維持原幀率，50／59.94／60fps 來源分別降至 25／29.97／30fps。降幀發生在解碼後、縮放與編碼前，不代表可省略解碼參考影格。視訊輸出固定 H.264、約 2.2 Mbps VBV；GPU 不可用時使用 x264 `superfast`、CRF 26。音訊為 AAC 80 kbps。播放器容許適度落後直播位置以吸收網路抖動，**並非低延遲直播方案**。
 
-若以 CPU 軟解 AVS2 4K／50fps 且同時軟編 H.264，可先比較 `--decoder-threads 4 --encoder-threads 2` 與預設雙 2 執行緒的效能。CLI 的 `--decoder-threads` 是全服務預設；為了不增加其他普通頻道的資源消耗，**建議僅對 4K AVS2 頻道**在 `channels.json` 加入可選的 `"decoder_threads": 4`（合法值 1～16）。該頻道的值優先於全服務預設，H.264 編碼仍可維持 2 執行緒。多路同時播放時應依 vCPU 數、其它工作負載及實際轉碼速度調整。**增加執行緒不能保證 4K50 即時轉碼。**
+未指定 `--encoder-threads` 與 `--decoder-threads` 時，啟動時會自動採用行程可使用的**邏輯 CPU 數量**（Linux 優先依 CPU affinity 判斷；無法取得時使用 `os.cpu_count()`，最少為 1）。例如可用 4 顆邏輯 CPU 時，兩者預設皆為 4；明確指定的數值仍優先。CLI 的 `--decoder-threads` 是全服務預設；個別頻道可在 `channels.json` 加入 `"decoder_threads": 4`（合法值 1～16）覆蓋全域值。每個不同頻道的 FFmpeg 各自使用執行緒數，且同一個頻道的解碼與軟編可能同時執行，**自動採用 CPU 數量並非保證即時效能**；多頻道或 CPU 繁忙時，可手動降低執行緒數。使用 VA-API 硬體編碼時，`--encoder-threads` 不直接控制硬體編碼器。
 
 **AVS／AVS+／AVS2 支援：** udisplayer **不包含完整 FFmpeg／libdavs2 原始碼或二進位檔**，只呼叫使用者自行安裝的外部 FFmpeg CLI。專案提供自己的 AWQ／AVS2 差異修補、固定上游版本的建置腳本與驗證測試，集中於 **[`tools/avs/`](tools/avs/README.md)**。使用者執行建置腳本時才會從第三方原作者的 Git 倉庫取得其 Patch 與參考資料，並先核對 SHA-256；原始第三方 AVX2 修補不會存放於本專案。詳見 [AVS 外部媒體堆疊](docs/avs.md) 與 [第三方授權聲明](THIRD_PARTY_NOTICES.md)。實驗性 AVS2 跳幀功能預設關閉。
 

@@ -162,7 +162,7 @@ def ffmpeg_command(settings: Settings, channel: Channel, directory: Path,
         "-analyzeduration", "4000000", "-probesize", "4000000",
         # Decoder thread count is independent of encoder workers. AVS2 4K
         # often benefits from more decoder threads without increasing x264's
-        # own thread count. Preserve the historical default of two.
+        # own thread count. Global defaults reflect available logical CPUs.
         "-threads", str(channel.decoder_threads or settings.decoder_threads), "-i", channel.url,
         "-map", "0:v:0", "-map", "0:a:0", "-sn", "-dn",
         # Some broadcast sources use non-square pixels (for example 720x576
