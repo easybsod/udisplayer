@@ -194,7 +194,7 @@ rebuffer while the next complete segment is encoded. Existing exhausted
 backend/cooldown behaviour still applies if every candidate fails.
 
 `--debug` reports the selected transcoder and fallback decisions in the
-  service journal. GPU probe warnings are also logged on startup.
+service journal. GPU probe warnings are also logged on startup.
 
 ## Confirm acceleration is active
 
