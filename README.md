@@ -317,7 +317,7 @@ python3 server.py --path /tv/my-long-private-path
 
 ### Linux：啟用 VA-API 硬體編解碼（選用）
 
-udisplayer 在 **Linux** 會自動尋找第一個可存取的 `/dev/dri/renderD*`。只要 FFmpeg、VA-API Runtime、顯示卡驅動及裝置權限都正常，就會**優先硬解來源視訊、優先以 GPU 編碼 H.264**；其中任何一端無法使用時，會獨立回退 CPU，不需要手動選擇輸入編碼格式。輸出一律為 H.264／AAC。
+udisplayer 在 **Linux** 會自動尋找第一個可存取的 `/dev/dri/renderD*`。只要 FFmpeg、VA-API Runtime、顯示卡驅動及裝置權限都正常，就會**優先硬解來源視訊、優先以 GPU 編碼 H.264**。當兩者均可用時，也會優先使用 GPU 去交錯及縮放（`deinterlace_vaapi`、`scale_vaapi`），減少影格在 GPU 和 CPU 間往返。GPU 濾鏡不相容時，會先回退原有 CPU 濾鏡並保留硬體編解碼；硬體解碼或編碼失敗時，再獨立回退軟體。輸出一律為 H.264／AAC。AVS／AVS2 保留軟解與既有 GPU 縮放選用策略。
 
 先安裝所用顯示卡的 VA-API 驅動及測試工具。例如在 **Ubuntu／Debian（Intel GPU）**：
 
@@ -350,9 +350,9 @@ python3 server.py --hw-render=/dev/dri/renderD128
 python3 server.py --hw-render=none
 ```
 
-如果使用單檔版，將 `python3 server.py` 換成 `./udisplayer-linux-x86_64`。多張 GPU 時，也可指定 `/dev/dri/by-path/` 下實際存在的 `pci-*-render` 符號連結；**明確指定的裝置若不存在或無權限，程式會報錯，不會偷偷切到另一張 GPU**。
+如果使用單檔版，將 `python3 server.py` 換成 `./udisplayer-linux-x86_64`。多張 GPU 時，也可指定 `/dev/dri/by-path/` 下實際存在的 `pci-*-render` 符號連結；**明確指定的裝置若不存在或無權限，程式會記錄警告並回退 CPU 軟體轉碼，不會偷偷切到另一張 GPU**。裝置路徑格式不合法則仍會報錯。
 
-加上 `--debug` 後，可從啟動日誌查看 `device_ok=True`、`h264_encode=True`，播放頻道時則會顯示 `transcoder=vaapi_decode_encode`、`transcoder=vaapi_encode` 等實際管線。若服務經 systemd 啟動，請另外確認執行帳號可存取 `render` 群組與 Render Node；設有 `PrivateDevices=true` 的系統服務還必須調整裝置隔離設定。
+加上 `--debug` 後，可從啟動日誌查看 `device_ok=True`、`h264_encode=True`，播放頻道時則會顯示 `transcoder=vaapi_decode_encode gpu_vpp=True`、`transcoder=vaapi_encode` 等實際管線。`gpu_vpp_fallback` 代表 GPU 濾鏡失敗後已回退 CPU 濾鏡，而非整個硬體編解碼失效。若服務經 systemd 啟動，請另外確認執行帳號可存取 `render` 群組與 Render Node；設有 `PrivateDevices=true` 的系統服務還必須調整裝置隔離設定。
 
 更完整的 [Linux VA-API 安裝、systemd 權限、排錯及回退說明](docs/HARDWARE-ACCELERATION.md) 見技術文件。
 

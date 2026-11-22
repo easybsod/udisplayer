@@ -111,7 +111,8 @@ class TranscoderTests(unittest.TestCase):
                 self.assertIn("-start_number 1234", rendered)
                 self.assertIn("discont_start", rendered)
                 self.assertIn("force_original_aspect_ratio=decrease", rendered)
-                self.assertIn("bwdif=mode=send_frame", rendered)
+                if backend != HW_DECODE_HW_ENCODE:
+                    self.assertIn("bwdif=mode=send_frame", rendered)
                 self.assertIn("fps=fps='min(30,if(gte(source_fps,50),source_fps/2,source_fps))'", rendered)
                 self.assertEqual(cmd[cmd.index("-fps_mode:v") + 1], "passthrough")
                 self.assertIn("-c:a aac", rendered)
@@ -124,10 +125,41 @@ class TranscoderTests(unittest.TestCase):
                 self.assertEqual("-rc_mode" in cmd, backend in
                                  (HW_DECODE_HW_ENCODE, SW_DECODE_HW_ENCODE))
                 if backend == HW_DECODE_HW_ENCODE:
-                    self.assertIn("scale_vaapi=format=nv12,hwdownload,format=nv12", rendered)
-                    self.assertIn("format=nv12,hwupload", rendered)
+                    self.assertIn("deinterlace_vaapi=mode=motion_adaptive:rate=frame:auto=1", rendered)
+                    self.assertIn("scale_vaapi=w='max(2,trunc(iw*if(gt(sar,0),sar,1)/2)*2)'", rendered)
+                    self.assertIn("scale_vaapi=w='min(iw,1920)'", rendered)
+                    self.assertIn("setsar=1", rendered)
+                    self.assertNotIn("hwdownload", rendered)
+                    self.assertNotIn("hwupload", rendered)
+                    self.assertLess(rendered.index("deinterlace_vaapi="), rendered.index("fps=fps="))
                 if backend == SOFTWARE:
                     self.assertNotIn("-init_hw_device", cmd)
+
+    def test_gpu_vpp_preserves_progressive_frames_and_cpu_filter_fallback(self):
+        settings = Settings(ffmpeg="/usr/bin/ffmpeg", hw_render="/dev/dri/renderD128",
+                            hw_decode=True, hw_encode=True)
+        progressive = Channel(2, "1080p", "http://127.0.0.1/progressive",
+                              video_scan="progressive")
+        gpu = ffmpeg_command(settings, progressive, Path("/tmp/gpu"),
+                             backend=HW_DECODE_HW_ENCODE)
+        gpu_filter = gpu[gpu.index("-vf") + 1]
+        self.assertNotIn("deinterlace_vaapi", gpu_filter)
+        self.assertIn("fps=fps=", gpu_filter)
+        self.assertIn("scale_vaapi", gpu_filter)
+        self.assertNotIn("hwdownload", gpu_filter)
+        self.assertNotIn("hwupload", gpu_filter)
+        cpu = ffmpeg_command(settings, self.channel, Path("/tmp/cpu"),
+                             backend=HW_DECODE_HW_ENCODE, enable_gpu_vpp=False)
+        cpu_filter = cpu[cpu.index("-vf") + 1]
+        self.assertIn("scale_vaapi=format=nv12,hwdownload,format=nv12", cpu_filter)
+        self.assertIn("bwdif=", cpu_filter)
+        self.assertIn("format=nv12,hwupload", cpu_filter)
+        self.assertEqual(cpu[cpu.index("-c:v") + 1], "h264_vaapi")
+        # The GPU VPP path is not attempted when either codec engine is software.
+        for backend in (SW_DECODE_HW_ENCODE, HW_DECODE_SW_ENCODE, SOFTWARE):
+            with self.subTest(backend=backend):
+                cmd = ffmpeg_command(settings, self.channel, Path("/tmp/cpu"), backend=backend)
+                self.assertNotIn("deinterlace_vaapi", cmd[cmd.index("-vf") + 1])
 
     def test_decoder_encoder_fallback_are_independent(self):
         base = dict(ffmpeg="/usr/bin/ffmpeg", hw_render="/dev/dri/renderD128")
@@ -225,6 +257,48 @@ class TranscoderTests(unittest.TestCase):
                         stream.errors.append("h264_vaapi encoding error")
                         self.assertTrue(manager._recover_locked(2, stream, "exit"))
                         self.assertEqual(stream.backends[stream.backend_index], SOFTWARE)
+                finally:
+                    manager.close()
+
+    def test_gpu_vpp_failure_retries_cpu_filters_without_disabling_codecs(self):
+        settings = Settings(ffmpeg="/usr/bin/ffmpeg", hw_render="/dev/dri/renderD128",
+                            hw_decode=True, hw_encode=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            commands = []
+            def spawn(cmd, **_kwargs):
+                commands.append(cmd)
+                return FakeProcess()
+            with patch("udisplayer.transcoder.subprocess.Popen", side_effect=spawn):
+                manager = StreamManager(Settings(**{**settings.__dict__, 'cache_dir': Path(tmp)}),
+                                        (self.channel,))
+                try:
+                    with manager.lock:
+                        stream = manager._ensure_locked(1, session='abcdef')
+                        token = stream.token
+                        self.assertIn('deinterlace_vaapi=', ' '.join(commands[0]))
+                        stream.errors.extend((
+                            'Failed to configure output pad on Parsed_deinterlace_vaapi_0',
+                            '[vf#0:0] Error reinitializing filters!',
+                            '[vost#0:0/h264_vaapi] Could not open encoder before EOF',
+                        ))
+                        self.assertTrue(manager._recover_locked(1, stream, 'exit'))
+                        self.assertTrue(stream.gpu_vpp_disabled)
+                        self.assertFalse(stream.decode_failed)
+                        self.assertFalse(stream.encode_failed)
+                        self.assertEqual(stream.backend_index, 0)
+                        self.assertEqual(stream.token, token)
+                        self.assertIn('abcdef', stream.sessions)
+                        self.assertIn('bwdif=', ' '.join(commands[1]))
+                        self.assertIn('hwdownload', ' '.join(commands[1]))
+                        self.assertIn('h264_vaapi', commands[1])
+                        self.assertIn('discont_start', ' '.join(commands[1]))
+                        # Subsequent genuine decoder failure follows existing
+                        # codec fallback; never retry the unsupported VPP stage.
+                        stream.errors.append('Failed setup for format vaapi in decoder')
+                        self.assertTrue(manager._recover_locked(1, stream, 'exit'))
+                        self.assertTrue(stream.decode_failed)
+                        self.assertEqual(stream.backends[stream.backend_index], SW_DECODE_HW_ENCODE)
+                        self.assertNotIn('deinterlace_vaapi', ' '.join(commands[2]))
                 finally:
                     manager.close()
 
@@ -362,8 +436,9 @@ class TranscoderTests(unittest.TestCase):
                             "[out#0/hls] Nothing was written into output file",
                         ))
                         self.assertTrue(manager._recover_locked(1, stream, "exit"))
-                        self.assertEqual(stream.backends[stream.backend_index], SW_DECODE_HW_ENCODE)
-                        self.assertTrue(stream.decode_failed)
+                        self.assertEqual(stream.backends[stream.backend_index], HW_DECODE_HW_ENCODE)
+                        self.assertTrue(stream.gpu_vpp_disabled)
+                        self.assertFalse(stream.decode_failed)
                         self.assertFalse(stream.encode_failed)
                 finally:
                     manager.close()

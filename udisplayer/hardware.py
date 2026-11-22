@@ -37,7 +37,11 @@ def select_render_device(requested: str | None) -> str | None:
         raise ValueError("--hw-render 必須是 none、/dev/dri/renderD* 或 /dev/dri/by-path/pci-*-render")
     node = Path(requested)
     if not _accessible(node):
-        raise ValueError("--hw-render 指定的 DRM Render Node 不存在或無法存取")
+        # A previously configured render node may disappear after a reboot or
+        # GPU pass-through change. Keep live TV available in software mode;
+        # malformed option values are still rejected above.
+        LOG.warning("--hw-render 指定的 DRM Render Node 不存在或無法存取：%s；回退軟體轉碼", requested)
+        return None
     return requested
 
 

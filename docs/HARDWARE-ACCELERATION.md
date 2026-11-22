@@ -38,8 +38,10 @@ python3 server.py --hw-render=none
 - Omit `--hw-render` to select the first accessible `/dev/dri/renderD*` on
   Linux. If none exists, use software without failing startup.
 - `--hw-render=none` disables **all** hardware decoding and encoding.
-- An explicit device must be a valid, accessible DRM render node. Invalid or
-  unavailable devices fail startup; no alternate GPU is silently substituted.
+- An explicit device must use a valid DRM render-node path. Invalid path
+  syntax fails startup. If a correctly specified node disappears or becomes
+  inaccessible, the service logs a warning and falls back to all-software
+  transcoding rather than failing startup; no alternate GPU is silently chosen.
 - With several GPUs, inspect `ls -l /dev/dri/by-path/*-render` and pass the
   existing `pci-*-render` symlink under `/dev/dri/by-path/` to `--hw-render`.
   This avoids relying on a render-node number that can change across boots.
@@ -101,8 +103,9 @@ Drivers that cannot hardware-decode a particular stream automatically fall
 back without denying software playback.
 
 When no render node or working VA-API driver exists, the application retains
-its CPU software pipeline. If an **explicitly** selected device is missing
-or inaccessible, startup instead fails with a clear configuration error.
+its CPU software pipeline. A configured but missing/inaccessible render node
+also falls back to software with a warning. Malformed device paths are still
+rejected as configuration errors.
 
 ## Permissions and systemd
 
@@ -162,6 +165,28 @@ whitelist or ban is applied to the incoming stream.
 
 On FFmpeg exit, initial segment timeout or HLS stall, the affected channel
 falls back only as needed.
+When both VA-API decoding and encoding are available, the channel first uses
+GPU video processing (VPP) to deinterlace and scale VA-API surfaces without
+downloading them to system memory. If `deinterlace_vaapi` or `scale_vaapi`
+cannot initialize or process a stream, the **first** retry keeps hardware
+decoding and H.264 encoding but restores the previous CPU `bwdif` and `scale`
+filters (`gpu_vpp_fallback`). Only if the retry also fails will the existing
+independent decoder/encoder fallback policy apply. This downgrade is scoped
+to the individual channel and persists until a new stream is started.
+
+`fps` and `setsar` still execute as lightweight FFmpeg filters on hardware
+frame metadata; they do not require a GPU-to-CPU image download. The GPU path
+maintains the maximum 1920×1080 resolution, square-pixel output, and the
+30 fps ceiling. `deinterlace_vaapi` uses motion-adaptive processing at the
+input frame rate with automatic interlace detection; explicit progressive
+channels skip deinterlacing. Support varies with the VA driver and content,
+so representative interlaced, progressive, and anamorphic streams should be
+tested before production deployment.
+
+AVS/AVS2 decoding remains software on this device. Because uploading complete
+4K AVS2 frames merely to resize them was previously measured to reduce
+throughput, the existing optional `avs2_gpu_scale` policy is unchanged; its
+own GPU-scale-to-CPU-scale fallback remains independent of this VPP path.
 Unrelated channels are not restarted. A fallback preserves the channel token,
 viewer sessions and HLS URL, starts higher-numbered HLS segments, and marks
 the new playlist with `EXT-X-DISCONTINUITY`. Viewers may experience a brief
@@ -169,7 +194,7 @@ rebuffer while the next complete segment is encoded. Existing exhausted
 backend/cooldown behaviour still applies if every candidate fails.
 
 `--debug` reports the selected transcoder and fallback decisions in the
-service journal. GPU probe warnings are also logged on startup.
+  service journal. GPU probe warnings are also logged on startup.
 
 ## Confirm acceleration is active
 
@@ -194,14 +219,14 @@ generations may support different acceleration paths.
 
 ## Media-processing constraints
 
-- All profiles preserve deinterlacing with the existing CPU `bwdif` filter,
-  sample-aspect-ratio normalization, aspect-preserving 1920×1080 ceiling,
-  2-second HLS segments, and AAC audio output.
-- GPU decoding uses VA-API surfaces and converts them to NV12 on the GPU,
-  then downloads frames for the existing deinterlacing and sizing filters.
-  If hardware encoding is selected, the resulting NV12 frames are uploaded
-  again. **This is not a GPU zero-copy pipeline.** Full hardware-only VPP may
-  be considered separately after source-specific aspect and interlace tests.
+- All profiles preserve deinterlacing, sample-aspect-ratio normalization,
+  aspect-preserving 1920×1080 ceiling, 2-second HLS segments, and AAC audio.
+- When both codec engines are accelerated, VA-API surfaces remain on the GPU
+  for `deinterlace_vaapi`, `scale_vaapi`, and `h264_vaapi`. The software-filter
+  fallback downloads frames for `bwdif` and `scale`, then uploads them again
+  for hardware encoding. Both paths emit progressive H.264.
+- Hardware decoding with software encoding still downloads frames for CPU
+  filters; software-decoded AVS/AVS2 keeps its existing conservative policy.
 - Output is always H.264 8-bit; HEVC is accepted as an **input** and uses the
   same hardware-preferred decode policy. There is no HEVC or VP9 HLS output.
 - Concurrent transcoding throughput is limited by the GPU, shared memory

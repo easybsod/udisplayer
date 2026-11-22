@@ -11,12 +11,13 @@ class HardwareTests(unittest.TestCase):
         with patch("udisplayer.hardware.Path.glob", return_value=[]):
             self.assertIsNone(select_render_device(None))
 
-    def test_render_device_rejects_unsafe_and_missing_paths(self):
+    def test_render_device_rejects_unsafe_and_falls_back_on_missing_paths(self):
         for value in ("auto", "../../dev/dri/renderD128", "/tmp/renderD128", "", "renderD128"):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "--hw-render"):
                 select_render_device(value)
-        with self.assertRaisesRegex(ValueError, "不存在或無法存取"):
-            select_render_device("/dev/dri/renderD999999")
+        with self.assertLogs("udisplayer", level="WARNING") as recorded:
+            self.assertIsNone(select_render_device("/dev/dri/renderD999999"))
+        self.assertIn("回退軟體轉碼", recorded.output[0])
 
     def test_probe_requires_actual_encoder_success(self):
         self.assertEqual(probe_vaapi("/ffmpeg", None), (False, False, "auto"))

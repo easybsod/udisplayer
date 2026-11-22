@@ -56,6 +56,11 @@ DECODE_ERRORS = re.compile(
     r"failed to retrieve.*frame|impossible to convert between the formats|"
     r"error reinitializing filters|auto_scale_", re.I,
 )
+VPP_ERRORS = re.compile(
+    r"deinterlace_vaapi|scale_vaapi|vaapi_vpp|VAProc|"
+    r"failed to (?:configure|process|submit).*filter|"
+    r"error reinitializing filters|impossible to convert between the formats", re.I,
+)
 ENCODE_ERRORS = re.compile(
     r"encoder failed to initialize|failed to (?:initialize|initialise) encoder|"
     r"error (?:initializing|initialising) output stream|error while opening encoder|"
@@ -98,7 +103,8 @@ class StreamError(Exception):
 def ffmpeg_command(settings: Settings, channel: Channel, directory: Path,
                    *, backend: str = SOFTWARE, start_number: int | None = None,
                    discontinuity: bool = False,
-                   enable_gpu_scale: bool = True) -> list[str]:
+                   enable_gpu_scale: bool = True,
+                   enable_gpu_vpp: bool = True) -> list[str]:
     # Preserve source resolution up to 1080p. Larger sources are downscaled
     # inside 1920x1080, cap output at 30 fps, then encode as progressive
     # H.264/AAC for broad browser compatibility and smoother Internet playback.
@@ -120,13 +126,29 @@ def ffmpeg_command(settings: Settings, channel: Channel, directory: Path,
                  and channel.video_scan == "progressive"
                  and channel.codec_hint == "avs2"
                  and backend == SW_DECODE_HW_ENCODE)
+    # Keep VA-API decoded surfaces on the GPU for deinterlacing, cadence
+    # selection and scaling. The fps/set SAR filters operate on frame metadata
+    # without downloading the image. On VPP failure, retry this exact codec
+    # backend with the previously proven CPU filter chain.
+    gpu_vpp = enable_gpu_vpp and backend == HW_DECODE_HW_ENCODE
     deinterlace = ("" if channel.video_scan == "progressive" else
                    "bwdif=mode=send_frame:parity=auto:deint=interlaced,")
     frame_rate = "fps=fps='min(30,if(gte(source_fps,50),source_fps/2,source_fps))'"
     # Only when the source is confirmed progressive and GPU scale is explicitly
     # requested: 4K -> GPU upload -> VA-API scaling and 10-bit/8-bit conversion
     # -> h264_vaapi. Do not download frames or upload them a second time.
-    if gpu_scale:
+    if gpu_vpp:
+        gpu_deinterlace = ("" if channel.video_scan == "progressive" else
+                           "deinterlace_vaapi=mode=motion_adaptive:rate=frame:auto=1,")
+        video_filters = (
+            gpu_deinterlace + frame_rate + ","
+            "scale_vaapi=w='max(2,trunc(iw*if(gt(sar,0),sar,1)/2)*2)':"
+            "h='max(2,trunc(ih/2)*2)':format=nv12:mode=fast,setsar=1,"
+            "scale_vaapi=w='min(iw,1920)':h='min(ih,1080)':"
+            "force_original_aspect_ratio=decrease:force_divisible_by=2:"
+            "format=nv12:mode=fast"
+        )
+    elif gpu_scale:
         video_filters = (
             frame_rate + ",format=nv12,hwupload,"
             "scale_vaapi=w=1920:h=1080:format=nv12:mode=fast:"
@@ -232,6 +254,7 @@ class Stream:
     error_lock: threading.Lock = field(default_factory=threading.Lock)
     error_reader: threading.Thread | None = None
     gpu_scale_disabled: bool = False
+    gpu_vpp_disabled: bool = False
 
 
 class StreamManager:
@@ -386,7 +409,8 @@ class StreamManager:
             ffmpeg_command(self.settings, stream.channel, stream.directory,
                            backend=backend, start_number=stream.start_number,
                            discontinuity=discontinuity,
-                           enable_gpu_scale=not stream.gpu_scale_disabled),
+                           enable_gpu_scale=not stream.gpu_scale_disabled,
+                           enable_gpu_vpp=not stream.gpu_vpp_disabled),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE if self.settings.debug else subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -403,8 +427,9 @@ class StreamManager:
         reader.start()
         if self.settings.debug:
             threading.Thread(target=self._read_progress, args=(stream, process), daemon=True).start()
-        LOG.info("channel=%s transcoder=%s gpu_scale=%s progressive=%s pid=%s",
+        LOG.info("channel=%s transcoder=%s gpu_vpp=%s gpu_scale=%s progressive=%s pid=%s",
                  stream.channel.id, backend,
+                 backend == HW_DECODE_HW_ENCODE and not stream.gpu_vpp_disabled,
                  bool(stream.channel.avs2_gpu_scale and not stream.gpu_scale_disabled
                       and backend == SW_DECODE_HW_ENCODE),
                  stream.channel.video_scan == "progressive", process.pid)
@@ -432,6 +457,28 @@ class StreamManager:
         errors = "\n".join(messages)
         decoder_issue = bool(DECODE_ERRORS.search(errors))
         encoder_issue = bool(ENCODE_ERRORS.search(errors))
+        # GPU VPP is independent of both codec engines. A filter negotiation
+        # error is frequently followed by a misleading encoder EOF error;
+        # avoid downgrading the encoder until the CPU-filter retry is tested.
+        if (old == HW_DECODE_HW_ENCODE and not stream.gpu_vpp_disabled
+                and VPP_ERRORS.search(errors)):
+            if stream.process.poll() is None:
+                stream.process.terminate()
+                try:
+                    stream.process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    stream.process.kill()
+                    stream.process.wait(timeout=3)
+            stream.gpu_vpp_disabled = True
+            try:
+                self._launch(stream, discontinuity=True)
+            except OSError as exc:
+                LOG.warning("channel=%s gpu_vpp_fallback spawn_error=%s", cid,
+                            type(exc).__name__)
+                return False
+            LOG.warning("channel=%s gpu_vpp_fallback to=cpu_filters+vaapi_decode_encode reason=%s",
+                        cid, reason)
+            return True
         # If a newer GPU rejects GPU scaling or frame upload, retry within
         # the *same* VA-API encoder backend using the proven CPU scale path.
         # Do not downgrade working H.264 hardware encoding merely because a
