@@ -56,7 +56,7 @@ class Settings:
     host: str = "0.0.0.0"
     port: int = 8081
     startup_timeout: float = 30
-    idle_timeout: float = 60
+    idle_timeout: float = 20
     max_streams: int = 4
     encoder_threads: int = field(default_factory=available_cpu_threads)
     decoder_threads: int = field(default_factory=available_cpu_threads)

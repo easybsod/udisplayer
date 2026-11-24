@@ -268,6 +268,9 @@ class StreamManager:
         self.streams: dict[int, Stream] = {}
         self.cooldowns: dict[int, tuple[float, int]] = {}
         self.released_sessions: dict[tuple[int, str], float] = {}
+        # Explicit Web leases are independent of HLS reads. Legacy session IDs
+        # and anonymous external players retain request-based activity.
+        self.web_heartbeats: dict[tuple[int, str], float] = {}
         self.closed = threading.Event()
         self.reaper = threading.Thread(target=self._reap, daemon=True, name="stream-reaper")
         self.reaper.start()
@@ -541,14 +544,48 @@ class StreamManager:
                     cid, old, stream.backends[stream.backend_index], reason, prior_error)
         return True
 
-    @staticmethod
-    def _touch_locked(stream: Stream, session: str | None, now: float | None = None):
+    def _web_seen_locked(self, cid: int, session: str | None, now: float) -> float:
+        if session is None or not session.startswith("web-"):
+            return now
+        seen = self.web_heartbeats.get((cid, session))
+        if seen is None or now - seen >= self.settings.idle_timeout:
+            raise StreamError(410, "Web 工作階段心跳已逾時")
+        return seen
+
+    def heartbeat(self, cid: int, session: str):
+        """Renew a Web lease without starting or recovering any FFmpeg process."""
+        with self.lock:
+            if self.closed.is_set():
+                raise StreamError(503, "服務正在停止")
+            if cid not in self.channels or not session.startswith("web-"):
+                raise StreamError(404, "Not found")
+            now = time.monotonic()
+            key = (cid, session)
+            if self.released_sessions.get(key, 0) > now:
+                raise StreamError(410, "串流已釋放")
+            if key not in self.web_heartbeats and len(self.web_heartbeats) >= 4096:
+                raise StreamError(503, "Web 工作階段已達上限")
+            self.web_heartbeats[key] = now
+            stream = self.streams.get(cid)
+            if stream is not None and session in stream.sessions:
+                self._touch_locked(stream, session, now)
+
+    def _touch_locked(self, stream: Stream, session: str | None, now: float | None = None):
         now = time.monotonic() if now is None else now
-        stream.last_request = now
+        seen = self._web_seen_locked(stream.channel.id, session, now)
+        stream.last_request = max(stream.last_request, seen)
         if session is None:
             stream.anonymous_last_request = now
         else:
-            stream.sessions[session] = now
+            stream.sessions[session] = seen
+
+    def _has_viewers_locked(self, stream: Stream, now: float) -> bool:
+        for sid, seen in list(stream.sessions.items()):
+            if now - seen >= self.settings.idle_timeout:
+                stream.sessions.pop(sid, None)
+        anonymous_active = (stream.anonymous_last_request is not None
+                            and now - stream.anonymous_last_request < self.settings.idle_timeout)
+        return bool(stream.sessions) or anonymous_active
 
     def _ensure_locked(self, cid: int, session: str | None = None) -> Stream:
         if self.closed.is_set():
@@ -559,6 +596,7 @@ class StreamManager:
         now = time.monotonic()
         if session is not None and self.released_sessions.get((cid, session), 0) > now:
             raise StreamError(410, "串流已釋放")
+        self._web_seen_locked(cid, session, now)
         stream = self.streams.get(cid)
         if stream and stream.process.poll() is not None:
             if not self._recover_locked(cid, stream, "exit"):
@@ -642,6 +680,7 @@ class StreamManager:
             if (session is not None
                     and self.released_sessions.get((cid, session), 0) > time.monotonic()):
                 raise StreamError(410, "串流已釋放")
+            self._web_seen_locked(cid, session, time.monotonic())
             stream = self.streams.get(cid)
             if not stream or stream.token != token:
                 raise StreamError(410, "串流已過期，請重新取得播放清單")
@@ -661,18 +700,14 @@ class StreamManager:
                 return False
             now = time.monotonic()
             self.released_sessions[(cid, session)] = now + self.settings.idle_timeout
+            self.web_heartbeats.pop((cid, session), None)
             while len(self.released_sessions) > 4096:
                 self.released_sessions.pop(next(iter(self.released_sessions)))
             stream = self.streams.get(cid)
             if not stream:
                 return False
             stream.sessions.pop(session, None)
-            for sid, last_seen in list(stream.sessions.items()):
-                if now - last_seen > self.settings.idle_timeout:
-                    stream.sessions.pop(sid, None)
-            anonymous_active = (stream.anonymous_last_request is not None
-                                and now - stream.anonymous_last_request <= self.settings.idle_timeout)
-            if not stream.sessions and not anonymous_active:
+            if not self._has_viewers_locked(stream, now):
                 self._stop_locked(cid, "released")
                 return True
             return False
@@ -684,9 +719,12 @@ class StreamManager:
                 for key, expiry in list(self.released_sessions.items()):
                     if expiry <= now:
                         self.released_sessions.pop(key, None)
+                for key, seen in list(self.web_heartbeats.items()):
+                    if now - seen >= self.settings.idle_timeout:
+                        self.web_heartbeats.pop(key, None)
                 for cid, stream in list(self.streams.items()):
                     self._debug_hls_locked(cid, stream, now)
-                    if now - stream.last_request > self.settings.idle_timeout:
+                    if not self._has_viewers_locked(stream, now):
                         self._stop_locked(cid, "idle")
                     elif stream.process.poll() is not None:
                         if not self._recover_locked(cid, stream, "exit"):

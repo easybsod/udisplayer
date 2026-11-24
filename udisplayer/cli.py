@@ -61,7 +61,7 @@ def main(argv=None) -> int:
     parser.add_argument("--cache-dir", type=Path)
     parser.add_argument("--startup-timeout", type=positive)
     parser.add_argument("--idle-timeout", type=positive,
-                        help="頻道無活動後關閉其 FFmpeg 的秒數，預設 60")
+                        help="Web 心跳／直接取流閒置後關閉 FFmpeg 的秒數，預設 20")
     parser.add_argument("--max-streams", type=positive,
                         help="同時轉流的頻道上限，預設 4")
     parser.add_argument("--encoder-threads", type=positive,
@@ -124,7 +124,7 @@ def main(argv=None) -> int:
         settings = Settings(ffmpeg=ffmpeg, prefix=normalize_prefix(option("path", "/")),
                             host=option("host", "0.0.0.0"), port=option("port", 8081),
                             startup_timeout=option("startup_timeout", 30),
-                            idle_timeout=option("idle_timeout", 60), max_streams=option("max_streams", 4),
+                            idle_timeout=option("idle_timeout", 20), max_streams=option("max_streams", 4),
                             encoder_threads=option("encoder_threads", auto_threads),
                             decoder_threads=option("decoder_threads", auto_threads),
                             cache_dir=option("cache_dir"),

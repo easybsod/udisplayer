@@ -544,6 +544,13 @@ class Handler(BaseHTTPRequestHandler):
             raise StreamError(404, "Not found")
         cid = int(parts[1])
         session = self.session_from_query(query)
+        if len(parts) == 3 and parts[2] == "heartbeat":
+            if self.command != "POST" or session is None:
+                raise StreamError(404, "Not found")
+            manager.heartbeat(cid, session)
+            self.server.playback_touch(cid, session)
+            self.respond(204, b"")
+            return
         if len(parts) == 3 and parts[2] == "index.m3u8":
             if self.command not in ("GET", "HEAD"):
                 raise StreamError(404, "Not found")

@@ -21,8 +21,22 @@
   const createClientSession = () => {
     const bytes = new Uint8Array(16);
     window.crypto.getRandomValues(bytes);
-    return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+    return 'web-' + Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
   };
+  const heartbeatUrlFor = (channel, session) => {
+    const url = new URL(`hls/${encodeURIComponent(channel)}/heartbeat`, base);
+    url.searchParams.set('session', session);
+    return url;
+  };
+  async function renewHeartbeat(url) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
+    try {
+      const response = await fetch(url, {method: 'POST', cache: 'no-store', signal: controller.signal});
+      return response.ok;
+    } catch { return false; }
+    finally { clearTimeout(timer); }
+  }
   const prewarmSession = cid !== null && /^[1-9]\d*$/.test(cid) ? createClientSession() : null;
   let prewarmHandedOff = false;
   if (prewarmSession) {
@@ -38,7 +52,9 @@
     }, {once: true});
     // Start the cold FFmpeg/HLS path in parallel with channels.json and UI setup.
     // HEAD produces no media body but exercises the same playlist startup path.
-    fetch(prewarmUrl, {method: 'HEAD', cache: 'no-store'}).catch(() => {});
+    renewHeartbeat(heartbeatUrlFor(cid, prewarmSession)).then(ok => {
+      if (ok && !prewarmHandedOff) fetch(prewarmUrl, {method: 'HEAD', cache: 'no-store'}).catch(() => {});
+    });
   }
   const notice = (element, text, error = false) => {
     if (element.textContent !== text) element.textContent = text;
@@ -188,6 +204,7 @@
     const releaseUrl = new URL(`hls/${encodeURIComponent(channel.id)}/release`, base);
     releaseUrl.searchParams.set('session', clientSession);
     const telemetryUrl = new URL('telemetry', base);
+    const heartbeatUrl = heartbeatUrlFor(channel.id, clientSession);
     const nativeSupport = Boolean(video.canPlayType('application/vnd.apple.mpegurl'));
     // AVS+ broadcasts and CPU-decoded 4K AVS2 benefit from a larger steady
     // buffer: network delivery is fast but 2 s fragments can arrive with
@@ -206,11 +223,19 @@
       rebuilding: false, timer: null, due: 0, attempt: 0, ready: false, lastTime: 0,
       lastProgress: performance.now(), startedAt: 0, stableSince: 0, waitingSince: 0,
       lastEdge: 0, edgeAdvancedAt: 0, lagTicks: 0, lastSeek: 0, lastDrop: 0,
-      cap: -1, pausedAt: 0, hiddenAt: 0, recoveries: 0, liveJumps: 0, stalls: 0,
+      cap: -1, pausedAt: 0, blockedAt: 0, hiddenAt: 0, recoveries: 0, liveJumps: 0, stalls: 0,
       phase: 'loading', lastReason: '', lastHlsError: '', lastFragMs: null,
       lastFragBytes: null, lastFragKbps: null, normalPlayingSent: false
     };
     const visible = () => !document.hidden || document.pictureInPictureElement === video || video.webkitDisplayingFullscreen;
+    let heartbeatPending = null;
+    function sendHeartbeat() {
+      if (!state.intent || state.blocked || state.terminal || state.disposed) return Promise.resolve(false);
+      if (!heartbeatPending) {
+        heartbeatPending = renewHeartbeat(heartbeatUrl).finally(() => { heartbeatPending = null; });
+      }
+      return heartbeatPending;
+    }
     const liveRange = () => video.seekable.length ? video.seekable : video.buffered;
     const finite = value => Number.isFinite(value) ? Math.round(value * 1000) / 1000 : null;
     const bufferAhead = () => {
@@ -305,6 +330,7 @@
         if (generation !== state.generation || state.disposed) return;
         if (error.name === 'NotAllowedError') {
           state.blocked = true;
+          state.blockedAt = performance.now();
           state.rebuilding = false;
           state.phase = 'awaiting-play';
           setStatus('暫停中  按 ► 開始直播');
@@ -355,7 +381,7 @@
         // Background browser timers may be suspended. Visibility resume checks the deadline.
       }, delay);
     }
-    function connect(recovery = false) {
+    async function connect(recovery = false) {
       if (state.disposed || state.terminal || !state.intent) return;
       const generation = ++state.generation;
       state.rebuilding = true;
@@ -368,6 +394,11 @@
       state.hls?.destroy(); state.hls = null;
       video.removeAttribute('src');
       video.load();
+      // Establish a lease before any playlist request, including after a
+      // suspended tab resumes. No heartbeat is tied to --debug.
+      const alive = await sendHeartbeat();
+      if (generation !== state.generation || state.disposed || !state.intent) return;
+      if (!alive) { scheduleRecovery('直播連線暫時中斷'); return; }
       const url = new URL(source);
       if (hlsSupported) {
         const retry = {maxNumRetry: 1, retryDelayMs: 500, maxRetryDelayMs: 1000};
@@ -454,7 +485,13 @@
     });
     video.addEventListener('play', () => {
       const wasPaused = !state.intent;
+      const wasBlocked = state.blocked;
       state.intent = true; state.blocked = false;
+      sendHeartbeat();
+      if (wasBlocked && performance.now() - state.blockedAt > 10000) {
+        scheduleRecovery('正在接上直播', true);
+        return;
+      }
       if (wasPaused) {
         if (performance.now() - state.pausedAt > 10000) scheduleRecovery('正在接上直播', true);
         else {
@@ -544,11 +581,13 @@
       }
     }
     const interval = setInterval(tick, 1000);
+    const heartbeatInterval = setInterval(sendHeartbeat, 5000);
     const telemetryInterval = debugEnabled ? setInterval(() => {
-      if (!state.disposed) sendTelemetry('heartbeat');
+      if (state.intent && !state.blocked && !state.terminal && !state.disposed) sendTelemetry('heartbeat');
     }, 15000) : null;
     function resumeCheck() {
       if (!visible() || !state.intent || state.blocked || state.terminal) return;
+      sendHeartbeat();
       if (state.hiddenAt && performance.now() - state.hiddenAt > 10000) scheduleRecovery('正在接上直播', true);
       else if (state.phase === 'recovering' || (state.timer !== null && performance.now() >= state.due)) scheduleRecovery('正在恢復連線', true);
       else tick();
@@ -570,6 +609,7 @@
       sendTelemetry('session_end', {reason: 'pagehide'}, true);
       state.disposed = true; ++state.generation;
       clearInterval(interval); if (telemetryInterval) clearInterval(telemetryInterval); clearTimeout(state.timer);
+      clearInterval(heartbeatInterval);
       probeController?.abort(); state.hls?.destroy(); state.hls = null;
       video.removeAttribute('src'); video.load();
       // Best-effort immediate release for normal navigation/tab/window close.

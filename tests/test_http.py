@@ -20,6 +20,10 @@ class FakeManager:
         self.playlist_sessions = []
         self.resources = []
         self.releases = []
+        self.heartbeats = []
+
+    def heartbeat(self, cid, session):
+        self.heartbeats.append((cid, session))
 
     def playlist(self, cid, session=None):
         self.playlist_calls += 1
@@ -77,6 +81,17 @@ class HttpTests(unittest.TestCase):
 
     def request(self, path, method='GET', headers=None, data=None):
         return self.request_to(self.base, path, method=method, headers=headers, data=data)
+
+    def test_heartbeat_route_does_not_request_playlist(self):
+        session = 'web-' + 'd' * 32
+        url = '/tv/secret/hls/1/heartbeat?session=' + session
+        count = self.manager.playlist_calls
+        status, _, body = self.request(url, method='POST', data=b'')
+        self.assertEqual((status, body), (204, b''))
+        self.assertEqual(self.manager.heartbeats[-1], (1, session))
+        self.assertEqual(self.manager.playlist_calls, count)
+        self.assertEqual(self.request(url)[0], 404)
+        self.assertEqual(self.request('/tv/secret/hls/1/heartbeat', method='POST', data=b'')[0], 404)
 
     def test_absolute_form_same_origin_requests_and_cross_origin_rejection(self):
         # urllib converts absolute URLs back into origin-form; send the actual
@@ -354,7 +369,11 @@ class HttpTests(unittest.TestCase):
         with self.server.playback_lock:
             last_seen = self.server.playback_sessions[(1, session)].last_seen
         with self.assertLogs('udisplayer', level='WARNING') as captured:
-            self.server._expire_playback_sessions(last_seen + self.server.settings.idle_timeout + 1)
+            # A not-yet-playing session keeps its existing startup diagnostic
+            # grace period even when the shared stream idle timeout is shorter.
+            timeout = max(self.server.settings.idle_timeout,
+                          self.server.settings.startup_timeout + 5)
+            self.server._expire_playback_sessions(last_seen + timeout + 1)
         output = '\n'.join(captured.output)
         self.assertIn('playback_end channel=1', output)
         self.assertIn('ok=false', output)

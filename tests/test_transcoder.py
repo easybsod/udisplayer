@@ -603,6 +603,77 @@ class TranscoderTests(unittest.TestCase):
                 finally:
                     manager.close()
 
+    def test_web_heartbeat_lease_and_mixed_viewers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(ffmpeg="/usr/bin/ffmpeg", cache_dir=Path(tmp))
+            self.assertEqual(settings.idle_timeout, 20)
+
+            def fake_popen(command, **_kwargs):
+                playlist = Path(command[-1])
+                playlist.write_text("#EXTM3U\n#EXTINF:2.0,\nsegment_000000001.ts\n")
+                (playlist.parent / "segment_000000001.ts").write_bytes(b"segment")
+                return FakeProcess()
+
+            with patch("udisplayer.transcoder.subprocess.Popen", side_effect=fake_popen) as popen:
+                manager = StreamManager(settings, (self.channel,))
+                first, second = "web-" + "a" * 32, "web-" + "b" * 32
+                try:
+                    with self.assertRaises(StreamError) as missing:
+                        manager.playlist(1, first)
+                    self.assertEqual(missing.exception.status, 410)
+                    manager.heartbeat(1, first)
+                    self.assertEqual(popen.call_count, 0)
+                    manager.playlist(1, first)
+                    stream = manager.streams[1]
+                    manager.heartbeat(1, second)
+                    manager.playlist(1, second)
+                    manager.playlist(1)
+                    self.assertEqual(popen.call_count, 1)
+                    # HLS reads must not renew a Web lease.
+                    with manager.lock:
+                        seen = time.monotonic() - 19
+                        manager.web_heartbeats[(1, first)] = seen
+                        stream.sessions[first] = seen
+                        manager.playlist(1, first)
+                        with manager.open_resource(1, stream.token, "segment_000000001.ts", first):
+                            pass
+                        self.assertEqual(stream.sessions[first], seen)
+                        manager.heartbeat(1, first)
+                        self.assertGreater(stream.sessions[first], seen)
+                        expired = time.monotonic() - 21
+                        manager.web_heartbeats[(1, first)] = expired
+                        stream.sessions[first] = expired
+                        with self.assertRaises(StreamError) as stale:
+                            manager.playlist(1, first)
+                        self.assertEqual(stale.exception.status, 410)
+                        self.assertTrue(manager._has_viewers_locked(stream, time.monotonic()))
+                        self.assertNotIn(first, stream.sessions)
+                        # Expire second Web viewer; anonymous direct viewer remains.
+                        manager.web_heartbeats[(1, second)] = expired
+                        stream.sessions[second] = expired
+                        self.assertTrue(manager._has_viewers_locked(stream, time.monotonic()))
+                        self.assertFalse(stream.sessions)
+                        # No remaining active viewer: reaper stops the pipeline.
+                        stream.anonymous_last_request = expired
+                    deadline = time.monotonic() + 3
+                    while 1 in manager.streams and time.monotonic() < deadline:
+                        time.sleep(.02)
+                    self.assertNotIn(1, manager.streams)
+                    self.assertIsNotNone(stream.process.poll())
+                    self.assertEqual(popen.call_count, 1)
+                    # A fresh heartbeat can recover a suspended player, but
+                    # cannot create a stream on its own.
+                    manager.heartbeat(1, first)
+                    self.assertNotIn(1, manager.streams)
+                    manager.playlist(1, first)
+                    self.assertEqual(popen.call_count, 2)
+                    self.assertTrue(manager.release(1, first))
+                    with self.assertRaises(StreamError) as released:
+                        manager.heartbeat(1, first)
+                    self.assertEqual(released.exception.status, 410)
+                finally:
+                    manager.close()
+
 
 if __name__ == "__main__":
     unittest.main()
